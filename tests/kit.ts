@@ -1,5 +1,6 @@
 import { mock } from 'claude-code/testing'
-import type { On, SessionCompactInput, SessionCompactResult, SessionMessage, ToolUseSummary } from 'claude-code'
+import type { MockClock } from 'claude-code/testing'
+import type { On, PromptDecoration, SessionCompactInput, SessionCompactResult, SessionMessage, ToolUseSummary } from 'claude-code'
 
 export const HOME = '/home/tester'
 export const SESSION = 'sess-1'
@@ -42,11 +43,20 @@ export const KEPT = assistant('The last answer before the cut.', 'h-kept')
 
 export const USAGE = { startedAt: 0, context: { window: 200000, tokens: 150000, percent: 75 }, rateLimits: [] }
 
+export type Fill = { text: string; decorations: readonly PromptDecoration[] | undefined }
+
 export type World = {
   files: Map<string, string>
   appended: string[]
   compactions: number
   instructions: Array<string | undefined>
+  /** The prompt box: what the person sees there. Like a box the engine refills after a drop, it keeps a submitted text. */
+  box: string
+  fills: Fill[]
+  /** The prompts that reached the bottom, past every plugin: what the model would read. */
+  submitted: string[]
+  toasts: string[]
+  clock: MockClock
 }
 
 export type SetupOptions = {
@@ -54,18 +64,23 @@ export type SetupOptions = {
   answer?: (e: SessionCompactInput) => SessionCompactResult
   /** False leaves the store unanswered, for a test that answers it itself. */
   store?: boolean
+  /** A write to a path this answers true for fails, as a full disk would. */
+  failWrite?: (path: string) => boolean
+  /** The prompt box refuses every fill, for this reason. */
+  fillRefusal?: 'no_composer' | 'dialog'
 }
 
 export const ENGINE_ANSWER = (): SessionCompactResult => ({ messages: [user(SUMMARY, 'h-sum'), KEPT], tokensBefore: 90000, tokensAfter: 12000 })
 
 /** The engine beneath the plugin: env, store, clock, files in memory, and the registrations. */
 export const setup = (on: On, options: SetupOptions = {}): World => {
-  const world: World = { files: new Map(), appended: [], compactions: 0, instructions: [] }
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const world: World = { files: new Map(), appended: [], compactions: 0, instructions: [], box: '', fills: [], submitted: [], toasts: [], clock }
   mock.env(on, { HOME })
   if (options.store !== false) mock.store(on)
-  mock.clock(on, { now: 1_700_000_000_000 })
   on('session.id', () => ({ value: SESSION }))
   on('fs.write', ($, e) => {
+    if (options.failWrite?.(e.path) === true) throw new Error(`ENOSPC: ${e.path}`)
     world.files.set(e.path, e.text)
     return { value: undefined }
   })
@@ -89,6 +104,21 @@ export const setup = (on: On, options: SetupOptions = {}): World => {
     world.instructions.push(e.instructions)
     return options.answer === undefined ? ENGINE_ANSWER() : options.answer(e)
   })
+  on('prompt.read', () => ({ value: { text: world.box, cursor: world.box.length } }))
+  on('prompt.fill', ($, e) => {
+    if (options.fillRefusal !== undefined) return { isFilled: false, refusal: options.fillRefusal }
+    world.box = e.mode === 'replace' ? e.text : `${world.box}${e.text}`
+    world.fills.push({ text: e.text, decorations: e.decorations })
+    return { isFilled: true }
+  })
+  on('prompt.submit', ($, e) => {
+    world.submitted.push(e.text)
+    return { text: e.text }
+  })
+  on('ui.toast', ($, e) => {
+    world.toasts.push(e.text)
+    return { value: undefined }
+  })
   on('turn.step', async function* ($, e) {
     return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn' as const, usage: null }
   })
@@ -96,3 +126,17 @@ export const setup = (on: On, options: SetupOptions = {}): World => {
 }
 
 export const START = { cwd: '/repo', surface: 'terminal', isInteractive: true } as const
+
+export type StateWrite = { key: string; value: unknown }
+
+/** The test's engine has no state noun of its own: the writes are watched from beneath the plugin. */
+export const watchState = (on: On): StateWrite[] => {
+  const writes: StateWrite[] = []
+  on('state.set', ($, e, next) => {
+    writes.push({ key: e.key, value: e.value })
+    return next(e)
+  })
+  return writes
+}
+
+export const last = (writes: readonly StateWrite[], key: string): unknown => writes.filter(w => w.key === key).at(-1)?.value

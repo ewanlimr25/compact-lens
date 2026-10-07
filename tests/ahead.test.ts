@@ -1,22 +1,8 @@
 import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { On } from 'claude-code'
 
-import { APPLY, BEFORE, DIR, KEEP, setup, START, SUMMARY } from './kit'
-
-type StateWrite = { key: string; value: unknown }
-
-/** The test's engine has no state noun of its own: the writes are watched from beneath the plugin. */
-const watchState = (on: On): StateWrite[] => {
-  const writes: StateWrite[] = []
-  on('state.set', ($, e, next) => {
-    writes.push({ key: e.key, value: e.value })
-    return next(e)
-  })
-  return writes
-}
-
-const last = (writes: readonly StateWrite[], key: string): unknown => writes.filter(w => w.key === key).at(-1)?.value
+import { APPLY, BEFORE, DIR, KEEP, last, setup, START, SUMMARY, watchState } from './kit'
+import type { StateWrite } from './kit'
 const all = (writes: readonly StateWrite[], key: string): unknown[] => writes.filter(w => w.key === key).map(w => w.value)
 
 const step = async ($: Engine, index: number) => {

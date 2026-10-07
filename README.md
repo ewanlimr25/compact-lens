@@ -33,7 +33,15 @@ can pin facts. Once per window; a compaction re-arms it.
 `/compact-lens keep <text>`. Pinned notes go into the summariser's instructions ("keep these
 verbatim") and, whatever the summariser does, verbatim into the note after the summary.
 
-**Editing the summary afterwards.** Edit `<nn>/summary.md`, then:
+**Editing the summary afterwards, in the session.** Run `/compact-lens edit`, or press "Edit
+summary" in the pane. The latest summary goes into your prompt box under a dim header line. Edit
+it there, or press ctrl+g to edit it in your own editor, then press Enter: the mod catches that
+prompt before the model sees it, saves it to `<nn>/summary.md` and applies it. An empty box
+cancels. If the box already holds a draft of yours, the mod leaves it alone and says so. An edit
+of an older summary, made before a newer compaction ran, is kept in `<nn>/edit-unapplied.md`
+rather than applied.
+
+**Editing the summary file.** Edit `<nn>/summary.md` yourself, or ask the model to, then:
 
 - the model calls `mcp__compact-lens__apply`: the replacement runs when its turn ends;
 - or you run `/compact-lens apply`, or press "Apply summary.md" in the pane: it runs in a
@@ -48,7 +56,7 @@ you edit it before the compaction lands and the engine reuses the draft, your ed
 summary.
 
 **The pane.** `/compact-lens` opens it: the fill, the compactions, the pinned notes, and the
-apply and refresh buttons. `/compact-lens list` prints the same as text. A status line under the
+edit, apply and refresh buttons. `/compact-lens list` prints the same as text. A status line under the
 prompt reads `compact-lens: 72% · 1 compaction · 2 pinned`.
 
 Subagent compactions pass through untouched.
@@ -79,6 +87,9 @@ In `/config` under the plugin, or `pluginConfigs.compact-lens` in settings:
 .claude-plugin/plugin.json   the manifest, the options, the state contract's path
 hooks/hooks.json             names the hooks module
 hooks/register.tsx           every call on `$`: the hooks, the compaction, the tools, the command, the pane
+hooks/editor.ts              the edit in the prompt box: its header, finding it, judging it (pure)
+hooks/records.ts             a compaction's record and the message helpers (pure)
+hooks/texts.ts               the command's help and the tools' descriptions (pure)
 hooks/snapshot.ts            SessionMessage[] → before.md / after.md (pure)
 hooks/lost.ts                the lost report (pure)
 hooks/notes.ts               the note, the warning, the system-prompt section (pure)

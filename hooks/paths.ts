@@ -24,6 +24,18 @@ export const SUMMARY_HEAD_CHARS = 400
 /** How long after a turn ends an apply the model asked for is tried, and how often. */
 export const APPLY_DELAY_MS = 1500
 export const APPLY_RETRIES = 6
+/** How long after the command, or the pane's button, the summary goes into the prompt box: the engine empties the box on Enter first. */
+export const EDIT_FILL_DELAY_MS = 250
+/** How long after a caught edit the mod looks at the prompt box, and empties it if the engine put the edit back. */
+export const EDIT_CLEAR_DELAY_MS = 300
+/** How many characters of a short summary's opening identify an edit whose header line was deleted. */
+export const EDIT_HEAD_PROBE_CHARS = 80
+/** A summary line this long or longer tells the summary from another session's: headings and boilerplate are shorter. */
+export const EDIT_DISTINCT_LINE_CHARS = 40
+/** Below this many distinct lines a summary is matched by its opening instead. */
+export const EDIT_MIN_DISTINCT_LINES = 4
+/** How many numbered names a kept-aside edit tries before giving up on a free one. */
+export const FREE_NAME_TRIES = 100
 
 export type CompactionFiles = {
   dir: string

@@ -3,7 +3,9 @@
 import { atom, read, update } from 'claude-code'
 import type {
   EngineInterface,
-  PluginOptions,
+  HookFailure,
+  PromptSubmitInput,
+  PromptSubmitResult,
   Register,
   RenderInput,
   SessionCompactInput,
@@ -13,8 +15,9 @@ import type {
 } from 'claude-code'
 
 import type { CompactLensPin, CompactLensRecord } from '../types'
+import { buildEditDraft, editHeader, editReply, editStarted, fileStamp, judgeEdit, looksLikeEdit, parseEditHeader } from './editor'
+import type { EditSubmission } from './editor'
 import { computeLost, renderLost } from './lost'
-import type { LostReport } from './lost'
 import {
   buildApplyNote,
   buildNote,
@@ -22,6 +25,7 @@ import {
   buildPromptSection,
   buildWarning,
   mergeInstructions,
+  plural,
   renderPinned,
 } from './notes'
 import {
@@ -30,16 +34,21 @@ import {
   COMMAND,
   compactionFiles,
   draftFile,
+  EDIT_CLEAR_DELAY_MS,
+  EDIT_FILL_DELAY_MS,
+  FREE_NAME_TRIES,
   KEEP_TOOL,
   lensRoot,
   pad2,
   PANE_ID,
   pinnedFile,
   sessionDirOf,
-  SUMMARY_HEAD_CHARS,
 } from './paths'
 import type { CompactionFiles } from './paths'
-import { contextText, estimateTokens, findSummaryIndex, fmtTokens, renderTranscript, toJson, transcriptChars } from './snapshot'
+import { buildRecord, insertAfter, replaceAt, tokensOf, userMessage } from './records'
+import { contextText, findSummaryIndex, renderTranscript, toJson, transcriptChars } from './snapshot'
+import { APPLY_DESCRIPTION, ARGUMENT_HINT, EDIT_STARTED_TOAST, formatList, formatStatus, HELP, KEEP_DESCRIPTION, readConfig, SHOWN_RECORDS } from './texts'
+import type { Config } from './texts'
 
 // ---------------------------------------------------------------- state (declared here: the validator reads atoms in this file alone)
 
@@ -55,37 +64,16 @@ const pendingApplyAtom = atom({ plugin: 'compact-lens', key: 'pendingApply' } as
 const sessionDirAtom = atom({ plugin: 'compact-lens', key: 'sessionDir' } as const, NO_TEXT)
 const fillAtom = atom({ plugin: 'compact-lens', key: 'fill' } as const, NO_NUMBER)
 const draftAtom = atom({ plugin: 'compact-lens', key: 'draft' } as const, NO_TEXT)
+const editingAtom = atom({ plugin: 'compact-lens', key: 'editing' } as const, NO_NUMBER)
 
 // ---------------------------------------------------------------- config and small helpers
 
-type Config = { warnAtPercent: number; dir: string; openPane: boolean; statusLine: boolean }
-
-const DEFAULT_WARN_AT = 70
-const SHOWN_RECORDS = 10
-
-const readConfig = (options: PluginOptions): Config => ({
-  warnAtPercent: typeof options.warnAtPercent === 'number' ? options.warnAtPercent : DEFAULT_WARN_AT,
-  dir: typeof options.dir === 'string' ? options.dir : '',
-  openPane: options.openPane === true,
-  statusLine: options.statusLine !== false,
-})
-
 const log = ($: EngineInterface, line: string): void => $.ui.log(`compact-lens: ${line}`)
 
+/** A failed hook's reason, as a `.catch` handler reads it. */
+const failureText = (failure: HookFailure): string => failure.message ?? failure.kind
+
 const isoNow = async ($: EngineInterface): Promise<string> => new Date(await $.clock.now()).toISOString()
-
-const userMessage = (text: string): SessionMessage => ({ role: 'user', text, toolUses: [] })
-
-const replaceAt = (messages: readonly SessionMessage[], index: number, message: SessionMessage): SessionMessage[] =>
-  messages.map((one, i) => (i === index ? message : one))
-
-const insertAfter = (messages: readonly SessionMessage[], index: number, message: SessionMessage): SessionMessage[] => [
-  ...messages.slice(0, index + 1),
-  message,
-  ...messages.slice(index + 1),
-]
-
-const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`
 
 // ---------------------------------------------------------------- the store mirror
 
@@ -195,6 +183,166 @@ const scheduleApply = ($: EngineInterface, attempt = 0): void => {
   })
 }
 
+// ---------------------------------------------------------------- editing the summary in the prompt box
+
+type CurrentSummary = { n: number; files: CompactionFiles; text: string }
+
+/** The latest compaction's summary.md; the reason there is none to edit otherwise. */
+const currentSummary = async ($: EngineInterface): Promise<CurrentSummary | string> => {
+  const [records, dir] = await Promise.all([read($, recordsAtom), read($, sessionDirAtom)])
+  const latest = records.at(-1)
+  if (latest === undefined || dir === null) return 'no compaction has run yet, so there is no summary to edit'
+  const files = compactionFiles(dir, latest.n)
+  if (!(await $.fs.exists(files.summary))) return `${files.summary} is missing, so there is no summary to edit`
+  return { n: latest.n, files, text: await $.fs.read(files.summary) }
+}
+
+/** Puts the summary in the prompt box under its header and opens the edit; the reason when it did not go in. */
+const fillEditor = async ($: EngineInterface): Promise<string | undefined> => {
+  const current = await currentSummary($)
+  if (typeof current === 'string') return current
+  const box = await $.prompt.read()
+  if (box.text.trim() !== '') {
+    return parseEditHeader(box.text) === undefined
+      ? 'the prompt box holds a draft of yours; send or clear it, then ask for the edit again'
+      : 'an edit is already in the prompt box; Enter applies it, or empty the box and ask again to start over'
+  }
+  const header = editHeader(current.n)
+  const text = buildEditDraft(current.n, current.text)
+  const filled = await $.prompt.fill({ text, mode: 'replace', decorations: [{ start: 0, end: header.length, dimColor: true }] })
+  if (!filled.isFilled) {
+    const cause = filled.refusal === undefined ? '' : ` (${filled.refusal})`
+    return `the prompt box did not take the summary${cause}; edit ${current.files.summary} and run /${COMMAND} apply instead`
+  }
+  await update($, editingAtom, () => current.n)
+  return undefined
+}
+
+const reportEditFailure = ($: EngineInterface, failure: string): void => {
+  log($, `edit: ${failure}`)
+  $.ui.toast(`compact-lens: ${failure}`)
+}
+
+/** Fills the box and says so; any failure is reported, never thrown. */
+const startEdit = async ($: EngineInterface, success?: string): Promise<void> => {
+  try {
+    const failure = await fillEditor($)
+    if (failure !== undefined) reportEditFailure($, failure)
+    else if (success !== undefined) $.ui.toast(success)
+  } catch (error) {
+    reportEditFailure($, `the summary could not go into the prompt box (${String(error)})`)
+  }
+}
+
+/** The command's way: a moment later, once the engine has emptied the box for the Enter that ran the command. */
+const scheduleEdit = ($: EngineInterface): void => {
+  $.clock.after(EDIT_FILL_DELAY_MS, () => void startEdit($))
+}
+
+const closeEdit = async ($: EngineInterface): Promise<void> => {
+  if ((await read($, editingAtom)) !== null) await update($, editingAtom, () => null)
+}
+
+/** Empties the box if the engine put the caught prompt back in it; anything else there is left alone. */
+const scheduleClear = ($: EngineInterface, submitted: string): void => {
+  $.clock.after(EDIT_CLEAR_DELAY_MS, () => {
+    void (async () => {
+      try {
+        const box = await $.prompt.read()
+        if (box.text.trim() !== '' && box.text.trim() === submitted.trim()) await $.prompt.fill({ text: '', mode: 'replace' })
+      } catch (error) {
+        log($, `edit: the prompt box was not emptied (${String(error)})`)
+      }
+    })()
+  })
+}
+
+/** A path for a kept-aside text that holds nothing yet: `<stem>.md`, else `<stem>-2.md`, and so on. */
+const freePath = async ($: EngineInterface, stem: string): Promise<string> => {
+  for (let i = 1; i <= FREE_NAME_TRIES; i += 1) {
+    const path = i === 1 ? `${stem}.md` : `${stem}-${i}.md`
+    if (!(await $.fs.exists(path))) return path
+  }
+  throw new Error(`no free name for ${stem}.md`)
+}
+
+/** The edit in a submitted prompt: by its header, or, while an edit is open, by the open summary's own lines. */
+const recognizeEdit = async ($: EngineInterface, text: string): Promise<EditSubmission | undefined> => {
+  const byHeader = parseEditHeader(text)
+  if (byHeader !== undefined) return byHeader
+  const [n, dir] = await Promise.all([read($, editingAtom), read($, sessionDirAtom)])
+  if (n === null || dir === null) return undefined
+  const path = compactionFiles(dir, n).summary
+  const summary = (await $.fs.exists(path)) ? await $.fs.read(path) : ''
+  return looksLikeEdit(text, summary) ? { n, body: text.trim() } : undefined
+}
+
+/** A caught edit: saved to summary.md and applied, kept aside when there is no summary or a newer one, or dropped when empty. */
+const saveEdit = async ($: EngineInterface, edit: EditSubmission, isTurnRunning: boolean): Promise<string> => {
+  const [records, dir] = await Promise.all([read($, recordsAtom), read($, sessionDirAtom)])
+  if (dir === null) throw new Error('the snapshot folder is not set')
+  const latestN = records.at(-1)?.n
+  const summaryPath = compactionFiles(dir, latestN ?? edit.n).summary
+  const verdict = judgeEdit(edit, latestN)
+  const keptPath = verdict === 'none' || verdict === 'stale' ? await freePath($, `${compactionFiles(dir, edit.n).dir}/edit-unapplied-${fileStamp(await isoNow($))}`) : ''
+  if (verdict === 'none' || verdict === 'stale') await $.fs.write(keptPath, edit.body)
+  if (verdict === 'apply') {
+    await $.fs.write(summaryPath, edit.body)
+    await requestApply($)
+    scheduleApply($)
+  }
+  log($, `the edit of #${pad2(edit.n)} in the prompt box: ${verdict}`)
+  return editReply({ verdict, n: edit.n, latestN, summaryPath, keptPath, isTurnRunning })
+}
+
+/** When the edit hook fails on an edit: its text kept in a file where possible, and where. */
+const rescueEdit = async ($: EngineInterface, text: string): Promise<string> => {
+  try {
+    const dir = await read($, sessionDirAtom)
+    if (dir === null) return ''
+    const path = await freePath($, `${dir}/edit-unsaved-${fileStamp(await isoNow($))}`)
+    await $.fs.write(path, text)
+    return ` Your text is kept at ${path}.`
+  } catch {
+    return ''
+  }
+}
+
+type NextSubmit = (e: PromptSubmitInput) => Promise<PromptSubmitResult>
+
+const isPersonsOwn = (e: PromptSubmitInput): boolean => e.origin.kind === 'composer' || e.origin.kind === 'bridge'
+
+/**
+ * The person's Enter on an edit in the prompt box, caught before the model sees it. Any other prompt
+ * passes; one typed at the terminal closes an open edit, since it replaced the edit in the box.
+ */
+const handleSubmit = async ($: EngineInterface, e: PromptSubmitInput, next: NextSubmit): Promise<PromptSubmitResult> => {
+  if (!isPersonsOwn(e)) return next(e)
+  const edit = await recognizeEdit($, e.text)
+  if (edit === undefined) {
+    if (e.origin.kind === 'composer') await closeEdit($)
+    return next(e)
+  }
+  const reply = await saveEdit($, edit, e.turnId !== undefined)
+  await closeEdit($)
+  scheduleClear($, e.text)
+  return { drop: reply }
+}
+
+/**
+ * The edit hook failed: an edit, or any prompt while an edit is open, is kept out of the model's
+ * sight and saved aside, and the edit is closed, so a failure that persists costs one prompt, not all.
+ */
+const handleSubmitFailure = async ($: EngineInterface, e: PromptSubmitInput, failure: HookFailure, next: NextSubmit): Promise<PromptSubmitResult> => {
+  const reason = failureText(failure)
+  log($, `the edit hook failed: ${reason}`)
+  const isEditOpen = await read($, editingAtom).then(n => n !== null, () => true)
+  if (!isPersonsOwn(e) || (parseEditHeader(e.text) === undefined && !isEditOpen)) return next(e)
+  const kept = await rescueEdit($, e.text)
+  await closeEdit($).catch(error => log($, `edit: the open edit was not closed (${String(error)})`))
+  return { drop: `compact-lens: the edit could not be saved (${reason}), so nothing was applied.${kept} The prompt was not sent to the model.` }
+}
+
 // ---------------------------------------------------------------- the fill, the status line, the warning
 
 const refreshStatus = async ($: EngineInterface, config: Config): Promise<void> => {
@@ -271,36 +419,6 @@ const appendNote = async ($: EngineInterface, text: string): Promise<string | un
 // ---------------------------------------------------------------- compaction
 
 type NextCompact = (e: SessionCompactInput) => Promise<SessionCompactResult>
-
-type RecordArgs = {
-  n: number
-  trigger: CompactLensRecord['trigger']
-  at: string
-  files: CompactionFiles
-  before: readonly SessionMessage[]
-  after: readonly SessionMessage[]
-  summary: string
-  lost: LostReport
-  tokensBefore?: number
-  tokensAfter?: number
-}
-
-const buildRecord = (args: RecordArgs): CompactLensRecord => ({
-  n: args.n,
-  trigger: args.trigger,
-  at: args.at,
-  dir: args.files.dir,
-  messagesBefore: args.before.length,
-  messagesAfter: args.after.length,
-  charsBefore: transcriptChars(args.before),
-  charsAfter: transcriptChars(args.after),
-  tokensBefore: args.tokensBefore ?? null,
-  tokensAfter: args.tokensAfter ?? null,
-  summaryHead: args.summary.slice(0, SUMMARY_HEAD_CHARS),
-  promptsInSpan: args.lost.prompts.length,
-  filesInSpan: args.lost.filesEdited.length + args.lost.filesRead.length,
-  identifiersLost: args.lost.identifiersLostTotal,
-})
 
 const writeRecord = async (
   $: EngineInterface,
@@ -479,45 +597,20 @@ const handleCompact = async ($: EngineInterface, e: SessionCompactInput, next: N
 
 // ---------------------------------------------------------------- the slash command
 
-const HELP = [
-  `/${COMMAND}            open the pane and show the status`,
-  `/${COMMAND} list       list the compactions, their folders and the pinned notes`,
-  `/${COMMAND} keep <t>   pin a fact so it survives every compaction verbatim`,
-  `/${COMMAND} unpin <n>  remove pinned note n`,
-  `/${COMMAND} apply      replace the current summary with the edited summary.md`,
-].join('\n')
-
 const statusText = async ($: EngineInterface): Promise<string> => {
-  const [fill, records, pins, dir, pending] = await Promise.all([
+  const [fill, records, pins, dir, isPending] = await Promise.all([
     read($, fillAtom),
     read($, recordsAtom),
     read($, pinsAtom),
     read($, sessionDirAtom),
     read($, pendingApplyAtom),
   ])
-  const latest = records.at(-1)
-  const fillText = fill === null ? 'not measured yet' : `${fill}%`
-  return [
-    `compact-lens: context ${fillText}; ${plural(records.length, 'compaction')}; ${pins.length} pinned${pending ? '; an apply is pending' : ''}`,
-    `snapshots: ${dir ?? '(unset)'}`,
-    ...(latest === undefined
-      ? []
-      : [`latest: #${latest.n} (${latest.trigger}) at ${latest.at}: ${latest.messagesBefore} → ${latest.messagesAfter} messages, ${latest.dir}`]),
-  ].join('\n')
+  return formatStatus({ fill, records, pinCount: pins.length, dir, isPending })
 }
 
 const listText = async ($: EngineInterface): Promise<string> => {
   const [records, pins, dir] = await Promise.all([read($, recordsAtom), read($, pinsAtom), read($, sessionDirAtom)])
-  return [
-    `compactions (${records.length}):`,
-    ...(records.length === 0 ? ['  none yet'] : []),
-    ...records.map(r => {
-      const files = compactionFiles(dir ?? '', r.n)
-      return `  #${r.n} ${r.trigger} ${r.at}: ${r.messagesBefore} → ${r.messagesAfter} messages; ${files.before}; the span held ${r.promptsInSpan} prompts and ${r.filesInSpan} files; ${r.identifiersLost} identifiers no longer mentioned`
-    }),
-    `pinned (${pins.length}):`,
-    ...(pins.length === 0 ? ['  none'] : pins.map(p => `  ${p.id}. ${p.text}`)),
-  ].join('\n')
+  return formatList(records, pins, dir)
 }
 
 /** `/compact-lens [verb] [rest]`: the person's side of the mod. */
@@ -532,6 +625,12 @@ const runCommand = async ($: EngineInterface, args: string): Promise<{ text: str
     case 'status': {
       await $.ui.open({ id: PANE_ID, title: 'Compact Lens', focus: true })
       return { text: await statusText($) }
+    }
+    case 'edit': {
+      const current = await currentSummary($)
+      if (typeof current === 'string') return { text: `compact-lens: ${current}.` }
+      scheduleEdit($)
+      return { text: editStarted(current.n) }
     }
     case 'list':
       return { text: await listText($) }
@@ -557,12 +656,6 @@ const runCommand = async ($: EngineInterface, args: string): Promise<{ text: str
 }
 
 // ---------------------------------------------------------------- the pane
-
-const tokensOf = (record: CompactLensRecord): string => {
-  const before = record.tokensBefore ?? estimateTokens(record.charsBefore)
-  const after = record.tokensAfter ?? estimateTokens(record.charsAfter)
-  return `${fmtTokens(before)} → ${fmtTokens(after)}`
-}
 
 const applyFromPane = async ($: EngineInterface): Promise<void> => {
   await requestApply($)
@@ -613,6 +706,7 @@ const renderPane = async ($: EngineInterface, e: RenderInput<'Pane'>) => {
         ))}
       </Box>
       <Box gap={1}>
+        <Button key="edit" label="Edit summary" hotkey="e" onPress={() => void startEdit($, EDIT_STARTED_TOAST)} />
         <Button key="apply" label="Apply summary.md" hotkey="a" onPress={() => void applyFromPane($)} />
         <Button key="refresh" label="Refresh" hotkey="r" onPress={() => void readFill($)} />
         <Button key="close" label="Close" role="dismiss" onPress={() => void $.ui.close({ id: PANE_ID })} />
@@ -622,14 +716,6 @@ const renderPane = async ($: EngineInterface, e: RenderInput<'Pane'>) => {
 }
 
 // ---------------------------------------------------------------- registration
-
-const KEEP_DESCRIPTION =
-  'Pin a fact so it survives every compaction of this session verbatim: a decision, a path, a number, a name, a rule. ' +
-  "The note is put into the summariser's instructions and written, word for word, into the note that follows every summary. Keep each note short and self-contained."
-
-const APPLY_DESCRIPTION =
-  'Replace the current compaction summary with the edited summary.md of the latest compaction (its path is in the note after the summary and in the Compact Lens section). ' +
-  'Edit the file first with Edit, then call this; the replacement runs once this turn ends, with no summariser call. The transcript after the summary is kept as it is.'
 
 export const register: Register = (on, options) => {
   const config = readConfig(options)
@@ -647,8 +733,8 @@ export const register: Register = (on, options) => {
     await $.tool.register({ name: 'apply', description: APPLY_DESCRIPTION, inputSchema: { type: 'object', properties: {} } })
     await $.command.register({
       name: COMMAND,
-      description: 'Compact Lens: the pane, the pinned notes and the edited summary.',
-      argumentHint: '[list | keep <text> | unpin <n> | apply]',
+      description: 'Compact Lens: edit the summary, pin notes, open the pane.',
+      argumentHint: ARGUMENT_HINT,
     })
     await refreshStatus($, config)
     if (config.openPane && e.isInteractive) void $.ui.open({ id: PANE_ID, title: 'Compact Lens' })
@@ -656,7 +742,7 @@ export const register: Register = (on, options) => {
   })
 
   on('session.compact', ($, e, next) => handleCompact($, e, next)).catch(($, e, next) => {
-    log($, `the compaction hook failed and stood aside: ${String(next.error)}`)
+    log($, `the compaction hook failed and stood aside: ${failureText(next.error)}`)
     return next(e)
   })
 
@@ -681,7 +767,7 @@ export const register: Register = (on, options) => {
     if (note === '') return { deny: 'compact-lens: the note is empty' }
     const { id, count } = await pin($, note)
     return { result: `Pinned note ${id} (${count} pinned). It is kept verbatim through every compaction of this session.` }
-  }).catch(($, e, next) => ({ deny: `compact-lens: keep failed: ${String(next.error)}` }))
+  }).catch(($, e, next) => ({ deny: `compact-lens: keep failed: ${failureText(next.error)}` }))
 
   on('tool.call', { tool: 'mcp__compact-lens__apply' }, async $ => {
     const records = await read($, recordsAtom)
@@ -689,11 +775,13 @@ export const register: Register = (on, options) => {
     if (latest === undefined) return { deny: 'compact-lens: no compaction has run yet, so there is no summary to replace' }
     await requestApply($)
     return { result: `The edited ${latest.dir}/summary.md replaces the summary once this turn ends. End the turn to let it run.` }
-  }).catch(($, e, next) => ({ deny: `compact-lens: apply failed: ${String(next.error)}` }))
+  }).catch(($, e, next) => ({ deny: `compact-lens: apply failed: ${failureText(next.error)}` }))
 
   on('command.run', { command: 'compact-lens' }, ($, e) => runCommand($, e.args)).catch(($, e, next) => ({
-    text: `compact-lens: the command failed: ${String(next.error)}`,
+    text: `compact-lens: the command failed: ${failureText(next.error)}`,
   }))
+
+  on('prompt.submit', ($, e, next) => handleSubmit($, e, next)).catch(($, e, next) => handleSubmitFailure($, e, next.error, next))
 
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)

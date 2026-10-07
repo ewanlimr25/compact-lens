@@ -20,7 +20,7 @@ const tokensIn = (record: CompactLensRecord): string =>
 const tokensOut = (record: CompactLensRecord): string =>
   record.tokensAfter === null ? `~${fmtTokens(estimateTokens(record.charsAfter))} tokens, estimated` : `${fmtTokens(record.tokensAfter)} tokens`
 
-const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`
+export const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`
 
 const pinsBlock = (pins: readonly CompactLensPin[]): string[] =>
   pins.length === 0 ? [] : ['Pinned notes (kept verbatim through every compaction):', ...pins.map(p => `${p.id}. ${p.text}`)]
@@ -35,7 +35,7 @@ export const buildNote = ({ record, files, pins, keptCount }: NoteArgs): string 
     'Files, written by compact-lens (read them with Read or search them with Grep when the summary lacks something):',
     `- before.md   ${files.before}   the whole transcript that was compacted, every tool call with its input and result`,
     `- lost.md     ${files.lost}   the span's ${plural(record.promptsInSpan, 'prompt')} verbatim and its ${plural(record.filesInSpan, 'file')}, and the ${plural(record.identifiersLost, 'identifier')} the context no longer mentions`,
-    `- summary.md  ${files.summary}   the summary's text; edit it with Edit, then call ${APPLY_TOOL} to replace the summary above with it (after an apply, the newest folder's summary.md is the one to edit)`,
+    `- summary.md  ${files.summary}   the summary's text; edit it with Edit, then call ${APPLY_TOOL} to replace the summary above with it (after an apply, the newest folder's summary.md is the one to edit); the person can edit it in the prompt box with /${COMMAND} edit`,
     ...pinsBlock(pins),
     `Pin a fact for the next compaction with ${KEEP_TOOL}.`,
     '</compact-lens>',
@@ -67,7 +67,7 @@ export const buildPromptSection = ({ sessionDir, records, pinnedCount }: Section
   return [
     '# Compact Lens',
     `This session records every compaction under ${sessionDir}/<nn>/: before.md (the whole transcript that was compacted), lost.md (what the summary does not mention), summary.md (the summary's text, editable), after.md (what the context held right after). Compactions so far: ${records.length}${latest === undefined ? '' : `; latest: ${latest.dir} (${latest.trigger}, ${latest.at})`}. Pinned notes: ${pinnedCount}.`,
-    `Tools: ${KEEP_TOOL} pins a fact so it survives every compaction verbatim; ${APPLY_TOOL} replaces the current summary with the edited summary.md once the turn ends. The person runs /${COMMAND} for the pane, /${COMMAND} apply, /${COMMAND} keep <text>.`,
+    `Tools: ${KEEP_TOOL} pins a fact so it survives every compaction verbatim; ${APPLY_TOOL} replaces the current summary with the edited summary.md once the turn ends. The person runs /${COMMAND} edit to edit the summary in the prompt box (Enter applies it), /${COMMAND} for the pane, /${COMMAND} apply, /${COMMAND} keep <text>.`,
   ].join('\n')
 }
 

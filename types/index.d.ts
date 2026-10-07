@@ -43,6 +43,8 @@ declare module 'claude-code' {
       fill: number | null
       /** The summary the engine precomputed, as written to draft.md; null when none. */
       draft: string | null
+      /** The compaction whose summary is open for editing in the prompt box; null when none. */
+      editing: number | null
     }
   }
 }

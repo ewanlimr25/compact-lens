@@ -1,0 +1,35 @@
+{
+  "name": "compact-lens",
+  "version": "0.1.0",
+  "description": "See what a compaction takes away and what it leaves, pin facts that must survive it, and edit the summary afterwards.",
+  "author": {
+    "name": "Ewan"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "warnAtPercent": {
+      "type": "number",
+      "title": "Warn at",
+      "description": "Context fill, as a percent of the window, at which the model gets one note ahead of the compaction. 0 turns the note off.",
+      "default": 70
+    },
+    "dir": {
+      "type": "string",
+      "title": "Snapshot folder",
+      "description": "Where the snapshots go. Empty means ~/.claude/compact-lens.",
+      "default": ""
+    },
+    "openPane": {
+      "type": "boolean",
+      "title": "Open the pane at start",
+      "description": "Open the Compact Lens pane when a session starts. A wide terminal seats it; a narrow one keeps it waiting.",
+      "default": false
+    },
+    "statusLine": {
+      "type": "boolean",
+      "title": "Status line",
+      "description": "Keep a line under the prompt with the context fill, the compactions so far and the pinned notes.",
+      "default": true
+    }
+  }
+}

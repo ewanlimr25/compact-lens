@@ -31,7 +31,8 @@ claude plugin install compact-lens@compact-lens
 
 The first command adds the marketplace, and the second installs the mod for your user, in every
 session. Inside a session, `/plugin install compact-lens --marketplace ewanlimr25/compact-lens`
-does both. Then start a new session.
+does both. Then start a new session. The install notes that four options are not set yet: each
+has a default (see [Options](#options)), so there is nothing you must set.
 
 **From a clone**, to read or change the code:
 
@@ -240,7 +241,8 @@ Subagent compactions pass through untouched.
 
 ## Options
 
-In `/config` under the plugin, or `pluginConfigs.compact-lens` in settings:
+With `/plugin configure compact-lens@compact-lens` in a session; a clone's are rows in `/config`, or
+`pluginConfigs.compact-lens` in settings:
 
 | Option | Default | Meaning |
 |---|---|---|

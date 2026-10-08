@@ -2,52 +2,28 @@
 // only into functions declared here); the pure parts are in the sibling modules.
 import { atom, read, update } from 'claude-code'
 import type {
-  EngineInterface,
-  HookFailure,
-  PromptSubmitInput,
-  PromptSubmitResult,
-  Register,
-  RenderInput,
-  SessionCompactInput,
-  SessionCompactResult,
-  SessionMessage,
-  Timer,
+  EngineInterface, HookFailure, PromptSubmitInput, PromptSubmitResult, Register,
+  RenderInput, SessionCompactInput, SessionCompactResult, SessionMessage,
 } from 'claude-code'
 
 import type { CompactLensPin, CompactLensRecord } from '../types'
-import { buildEditDraft, editHeader, editReply, editStarted, fileStamp, judgeEdit, looksLikeEdit, parseEditHeader } from './editor'
-import type { EditSubmission } from './editor'
+import { buildEditDraft, editHeader, editReply, editStarted, fileStamp, isPersonsOwn, judgeEdit, looksLikeEdit, parseEditHeader } from './editor'
+import type { CurrentSummary, EditSubmission, NextSubmit, SavedEdit } from './editor'
 import { computeLost, renderLost } from './lost'
+import type { WarningFigures } from './notes'
+import { buildApplyNote, buildNote, figuresOf, fillPercent, buildPinnedDirective, buildPromptSection, buildWarning, mergeInstructions, plural, renderPinned } from './notes'
 import {
-  buildApplyNote,
-  buildNote,
-  buildPinnedDirective,
-  buildPromptSection,
-  buildWarning,
-  mergeInstructions,
-  plural,
-  renderPinned,
-} from './notes'
-import {
-  APPLY_DELAY_MS,
-  APPLY_RETRIES,
-  COMMAND,
-  compactionFiles,
-  draftFile,
-  EDIT_CLEAR_DELAY_MS,
-  EDIT_FILL_DELAY_MS,
-  FREE_NAME_TRIES,
-  KEEP_TOOL,
-  lensRoot,
-  pad2,
-  PANE_ID,
-  pinnedFile,
-  sessionDirOf,
+  COMMAND, COMPACT_COMMAND, COMPACT_FILL, compactionFiles, draftFile, EDIT_CLEAR_DELAY_MS, EDIT_FILL_DELAY_MS, FREE_NAME_TRIES,
+  KEEP_TOOL, lensRoot, pad2, PANE_ID, pinnedFile, sessionDirOf,
 } from './paths'
 import type { CompactionFiles } from './paths'
-import { buildRecord, insertAfter, replaceAt, tokensOf, userMessage } from './records'
+import type { NextCompact, RecordCompactionArgs } from './records'
+import { buildRecord, buildUnseenRecord, findRecordedSummary, heldLists, insertAfter, isRecordedSummary, replaceAt, summaryIn, userMessage } from './records'
 import { contextText, findSummaryIndex, renderTranscript, toJson, transcriptChars } from './snapshot'
-import { APPLY_DESCRIPTION, ARGUMENT_HINT, EDIT_STARTED_TOAST, formatList, formatStatus, HELP, KEEP_DESCRIPTION, readConfig, SHOWN_RECORDS } from './texts'
+import {
+  APPLY_DESCRIPTION, ARGUMENT_HINT, EDIT_STARTED_TOAST, failureText, formatList, formatShown, formatStatus, HELP, KEEP_DESCRIPTION,
+  OFFER_TOAST, paneLine, parseShow, readConfig, RUN_COMPACT_TOAST, SHOWN_RECORDS, statusLineText, storeKey, unseenBefore, unseenLost,
+} from './texts'
 import type { Config } from './texts'
 
 // ---------------------------------------------------------------- state (declared here: the validator reads atoms in this file alone)
@@ -68,16 +44,13 @@ const editingAtom = atom({ plugin: 'compact-lens', key: 'editing' } as const, NO
 
 // ---------------------------------------------------------------- config and small helpers
 
-const log = ($: EngineInterface, line: string): void => $.ui.log(`compact-lens: ${line}`)
+/** A dim transcript line; the engine prints it under the plugin's name. */
+const log = ($: EngineInterface, line: string): void => $.ui.log(line)
 
-/** A failed hook's reason, as a `.catch` handler reads it. */
-const failureText = (failure: HookFailure): string => failure.message ?? failure.kind
 
 const isoNow = async ($: EngineInterface): Promise<string> => new Date(await $.clock.now()).toISOString()
 
 // ---------------------------------------------------------------- the store mirror
-
-const storeKey = (sessionId: string): string => `session:${sessionId}`
 
 /** Mirrors the session's pins and records to the store, so a resumed session finds them. */
 const persist = async ($: EngineInterface): Promise<void> => {
@@ -86,19 +59,11 @@ const persist = async ($: EngineInterface): Promise<void> => {
   await $.store.set(storeKey(id), { pinned, compactions })
 }
 
-type Held = { pinned?: unknown; compactions?: unknown }
-
 /** Fills empty state from the store: a resumed session in a new process. */
 const restore = async ($: EngineInterface): Promise<void> => {
-  const held = await $.store.get(storeKey(await $.session.id()))
-  if (held === undefined || held === null || typeof held !== 'object') return
-  const { pinned, compactions } = held as Held
-  if (Array.isArray(compactions) && compactions.length > 0 && (await read($, recordsAtom)).length === 0) {
-    await update($, recordsAtom, () => compactions as CompactLensRecord[])
-  }
-  if (Array.isArray(pinned) && pinned.length > 0 && (await read($, pinsAtom)).length === 0) {
-    await update($, pinsAtom, () => pinned as CompactLensPin[])
-  }
+  const { pinned, compactions } = heldLists(await $.store.get(storeKey(await $.session.id())))
+  if (compactions.length > 0 && (await read($, recordsAtom)).length === 0) await update($, recordsAtom, () => compactions)
+  if (pinned.length > 0 && (await read($, pinsAtom)).length === 0) await update($, pinsAtom, () => pinned)
 }
 
 // ---------------------------------------------------------------- pinned notes
@@ -126,69 +91,107 @@ const unpin = async ($: EngineInterface, id: number): Promise<boolean> => {
 
 // ---------------------------------------------------------------- the apply of an edited summary
 
-const requestApply = async ($: EngineInterface): Promise<void> => {
-  await update($, pendingApplyAtom, () => true)
+// The engine never runs a plugin's own session.compact hook for a compaction that plugin asked for
+// with $.session.compact(): its summariser runs instead. So an apply rides on the person's /compact,
+// which the hook answers with the edited summary.
+
+/** Sets whether an edit waits, and redraws the status line, which says so. */
+const setPending = async ($: EngineInterface, isPending: boolean): Promise<void> => {
+  await update($, pendingApplyAtom, () => isPending)
+  await refreshStatus($)
 }
 
-type ApplyOutcome = { kind: 'applied' | 'skipped' | 'refused'; text: string }
+const requestApply = ($: EngineInterface): Promise<void> => setPending($, true)
 
-// The one apply in flight and the one timer waiting, whichever route asked; a reload drops both.
-let applying: Promise<ApplyOutcome> | undefined
-let applyTimer: Timer | undefined
+// The model's apply offers /compact when its turn ends; a reload forgets it, and the status line still says an apply waits.
+let isOfferDue = false
 
-const cancelApplyTimer = (): void => {
-  applyTimer?.cancel()
-  applyTimer = undefined
+/** Puts `text` in the prompt box when the box is empty or holds only `replaced` (a caught prompt the engine put back); whether the box holds `text` now. */
+const fillFree = async ($: EngineInterface, text: string, replaced?: string): Promise<boolean> => {
+  const box = (await $.prompt.read()).text.trim()
+  const isFree = box === '' || (replaced !== undefined && box === replaced.trim())
+  if (!isFree || box === text.trim()) return box === text.trim()
+  return (await $.prompt.fill({ text, mode: 'replace' })).isFilled
 }
+
+/** Puts /compact in the prompt box when the box is free, else says to run it; never throws. */
+const offerCompact = async ($: EngineInterface, replaced?: string): Promise<void> => {
+  const isOffered = await fillFree($, COMPACT_FILL, replaced).catch(error => {
+    log($, `apply: ${COMPACT_COMMAND} did not go into the prompt box (${String(error)})`)
+    return false
+  })
+  $.ui.toast(isOffered ? OFFER_TOAST : RUN_COMPACT_TOAST)
+}
+
+const scheduleOffer = ($: EngineInterface, delayMs: number, replaced?: string): void => {
+  $.clock.after(delayMs, () => void offerCompact($, replaced))
+}
+
+/** The summary.md an apply would use, when it differs from the summary the conversation runs on; the reason otherwise. */
+const checkApplicable = async ($: EngineInterface): Promise<{ path: string } | string> => {
+  await syncUnseen($)
+  const [records, dir] = await Promise.all([read($, recordsAtom), read($, sessionDirAtom)])
+  const latest = records.at(-1)
+  if (latest === undefined || dir === null) return 'no compaction has run yet, so there is no summary to replace'
+  const path = compactionFiles(dir, latest.n).summary
+  if (!(await $.fs.exists(path))) return `${path} is missing`
+  const edited = (await $.fs.read(path)).trim()
+  if (edited === '') return `${path} is empty`
+  const inUse = await summaryNow($, records)
+  if (inUse === undefined || !isRecordedSummary(inUse, latest)) return `the summary of #${pad2(latest.n)} is not the one in use now, so there is nothing for ${path} to replace`
+  if (inUse.trim() === edited) return `${path} is the summary in use; edit it first`
+  return { path }
+}
+
+/** A compaction other than the person's /compact ran while an edit waited: the edit is of a summary no longer in use. */
+const supersedeApply = async ($: EngineInterface): Promise<void> => {
+  await setPending($, false)
+  const text = `a compaction ran before the edited summary was applied, so it was not; the edit stays in the previous folder's summary.md, and /${COMMAND} edit loads the new summary`
+  log($, text)
+  $.ui.toast(text)
+}
+
+// ---------------------------------------------------------------- a compaction the mod did not see
+
+/** The summary the conversation runs on: the engine puts it first in the next request; undefined before any compaction. */
+const summaryNow = async ($: EngineInterface, records: readonly CompactLensRecord[]): Promise<string | undefined> =>
+  summaryIn(await $.session.messages({ as: 'api' }), await $.session.messages(), records.map(r => r.summaryHead))
 
 /**
- * Runs the pending apply: a plugin-triggered compaction our own hook answers. The engine refuses
- * it from a hook that holds the turn (a command, a tool call) and allows it from `turn.complete`.
- * Two routes asking at once share one run, so a second dispatch never reaches the summariser.
+ * Records the compaction the conversation's summary came from when the mod did not see it run (a
+ * reload, the mod not loaded): its summary and what follows, so it can be shown, edited and applied.
  */
-const applyNow = ($: EngineInterface): Promise<ApplyOutcome> => {
-  if (applying !== undefined) return applying
-  cancelApplyTimer()
-  const run = async (): Promise<ApplyOutcome> => {
-    try {
-      const ran = await $.session.compact()
-      return ran.skip === undefined
-        ? { kind: 'applied', text: 'the summary was replaced from summary.md' }
-        : { kind: 'skipped', text: `not applied: ${ran.skip}` }
-    } catch (error) {
-      return { kind: 'refused', text: `could not run now (${String(error)})` }
-    } finally {
-      applying = undefined
-    }
-  }
-  applying = run()
-  return applying
+const syncUnseen = ($: EngineInterface): Promise<void> => {
+  syncing ??= adoptUnseen($).finally(() => (syncing = undefined))
+  return syncing
 }
 
-/** Tries the pending apply from a timer of its own, again while the engine refuses it: the command's and the pane's way. */
-const scheduleApply = ($: EngineInterface, attempt = 0): void => {
-  cancelApplyTimer()
-  applyTimer = $.clock.after(APPLY_DELAY_MS, () => {
-    applyTimer = undefined
-    void (async () => {
-      if (!(await read($, pendingApplyAtom))) return
-      const outcome = await applyNow($)
-      if (outcome.kind === 'refused' && attempt < APPLY_RETRIES) {
-        scheduleApply($, attempt + 1)
-        return
-      }
-      log($, `apply: ${outcome.text}${outcome.kind === 'refused' ? '; it runs when the next turn ends' : ''}`)
-      $.ui.toast(`compact-lens: ${outcome.text}`)
-    })()
-  })
+// One look at a time: two at once (a command and its timer) would record the same compaction twice.
+let syncing: Promise<void> | undefined
+
+const adoptUnseen = async ($: EngineInterface): Promise<void> => {
+  const [records, dir] = await Promise.all([read($, recordsAtom), read($, sessionDirAtom)])
+  if (dir === null) return
+  const text = await summaryNow($, records)
+  if (text === undefined || records.some(r => isRecordedSummary(text, r))) return
+  const rows = await $.session.messages()
+  const index = rows.findIndex(m => m.role === 'user' && m.text === text)
+  const after = index < 0 ? [userMessage(text)] : rows.slice(index)
+  const n = records.length + 1
+  const files = compactionFiles(dir, n)
+  const at = await isoNow($)
+  await $.fs.write(files.before, unseenBefore(n, at))
+  await $.fs.write(files.summary, text)
+  await $.fs.write(files.lost, unseenLost(n, at))
+  await writeRecord($, buildUnseenRecord({ n, at, files, after, summary: text }), files, after)
+  log($, `compaction #${n} ran unseen; its summary is recorded in ${files.summary}`)
 }
 
 // ---------------------------------------------------------------- editing the summary in the prompt box
 
-type CurrentSummary = { n: number; files: CompactionFiles; text: string }
-
-/** The latest compaction's summary.md; the reason there is none to edit otherwise. */
+/** The latest compaction's summary.md, one the mod did not see run included; the reason there is none to edit otherwise. */
 const currentSummary = async ($: EngineInterface): Promise<CurrentSummary | string> => {
+  await syncUnseen($)
   const [records, dir] = await Promise.all([read($, recordsAtom), read($, sessionDirAtom)])
   const latest = records.at(-1)
   if (latest === undefined || dir === null) return 'no compaction has run yet, so there is no summary to edit'
@@ -212,7 +215,7 @@ const fillEditor = async ($: EngineInterface): Promise<string | undefined> => {
   const filled = await $.prompt.fill({ text, mode: 'replace', decorations: [{ start: 0, end: header.length, dimColor: true }] })
   if (!filled.isFilled) {
     const cause = filled.refusal === undefined ? '' : ` (${filled.refusal})`
-    return `the prompt box did not take the summary${cause}; edit ${current.files.summary} and run /${COMMAND} apply instead`
+    return `the prompt box did not take the summary${cause}; edit ${current.files.summary}, run /${COMMAND} apply, then ${COMPACT_COMMAND}`
   }
   await update($, editingAtom, () => current.n)
   return undefined
@@ -220,7 +223,7 @@ const fillEditor = async ($: EngineInterface): Promise<string | undefined> => {
 
 const reportEditFailure = ($: EngineInterface, failure: string): void => {
   log($, `edit: ${failure}`)
-  $.ui.toast(`compact-lens: ${failure}`)
+  $.ui.toast(failure)
 }
 
 /** Fills the box and says so; any failure is reported, never thrown. */
@@ -245,16 +248,7 @@ const closeEdit = async ($: EngineInterface): Promise<void> => {
 
 /** Empties the box if the engine put the caught prompt back in it; anything else there is left alone. */
 const scheduleClear = ($: EngineInterface, submitted: string): void => {
-  $.clock.after(EDIT_CLEAR_DELAY_MS, () => {
-    void (async () => {
-      try {
-        const box = await $.prompt.read()
-        if (box.text.trim() !== '' && box.text.trim() === submitted.trim()) await $.prompt.fill({ text: '', mode: 'replace' })
-      } catch (error) {
-        log($, `edit: the prompt box was not emptied (${String(error)})`)
-      }
-    })()
-  })
+  $.clock.after(EDIT_CLEAR_DELAY_MS, () => void fillFree($, '', submitted).catch(error => log($, `edit: the prompt box was not emptied (${String(error)})`)))
 }
 
 /** A path for a kept-aside text that holds nothing yet: `<stem>.md`, else `<stem>-2.md`, and so on. */
@@ -277,22 +271,20 @@ const recognizeEdit = async ($: EngineInterface, text: string): Promise<EditSubm
   return looksLikeEdit(text, summary) ? { n, body: text.trim() } : undefined
 }
 
-/** A caught edit: saved to summary.md and applied, kept aside when there is no summary or a newer one, or dropped when empty. */
-const saveEdit = async ($: EngineInterface, edit: EditSubmission, isTurnRunning: boolean): Promise<string> => {
+/** A caught edit: saved to summary.md for the apply, kept aside when there is no summary or a newer one, or dropped when empty or unchanged. */
+const saveEdit = async ($: EngineInterface, edit: EditSubmission, isTurnRunning: boolean): Promise<SavedEdit> => {
   const [records, dir] = await Promise.all([read($, recordsAtom), read($, sessionDirAtom)])
   if (dir === null) throw new Error('the snapshot folder is not set')
   const latestN = records.at(-1)?.n
   const summaryPath = compactionFiles(dir, latestN ?? edit.n).summary
-  const verdict = judgeEdit(edit, latestN)
+  const verdict = judgeEdit(edit, latestN, await summaryNow($, records))
   const keptPath = verdict === 'none' || verdict === 'stale' ? await freePath($, `${compactionFiles(dir, edit.n).dir}/edit-unapplied-${fileStamp(await isoNow($))}`) : ''
   if (verdict === 'none' || verdict === 'stale') await $.fs.write(keptPath, edit.body)
-  if (verdict === 'apply') {
-    await $.fs.write(summaryPath, edit.body)
-    await requestApply($)
-    scheduleApply($)
-  }
+  const isApplyDropped = verdict === 'unchanged' && (await read($, pendingApplyAtom))
+  if (verdict === 'apply' || isApplyDropped) await $.fs.write(summaryPath, edit.body)
+  if (verdict === 'apply' || isApplyDropped) await setPending($, verdict === 'apply')
   log($, `the edit of #${pad2(edit.n)} in the prompt box: ${verdict}`)
-  return editReply({ verdict, n: edit.n, latestN, summaryPath, keptPath, isTurnRunning })
+  return { reply: editReply({ verdict, n: edit.n, latestN, summaryPath, keptPath, isTurnRunning, isApplyDropped }), isApply: verdict === 'apply' }
 }
 
 /** When the edit hook fails on an edit: its text kept in a file where possible, and where. */
@@ -308,10 +300,6 @@ const rescueEdit = async ($: EngineInterface, text: string): Promise<string> => 
   }
 }
 
-type NextSubmit = (e: PromptSubmitInput) => Promise<PromptSubmitResult>
-
-const isPersonsOwn = (e: PromptSubmitInput): boolean => e.origin.kind === 'composer' || e.origin.kind === 'bridge'
-
 /**
  * The person's Enter on an edit in the prompt box, caught before the model sees it. Any other prompt
  * passes; one typed at the terminal closes an open edit, since it replaced the edit in the box.
@@ -323,10 +311,11 @@ const handleSubmit = async ($: EngineInterface, e: PromptSubmitInput, next: Next
     if (e.origin.kind === 'composer') await closeEdit($)
     return next(e)
   }
-  const reply = await saveEdit($, edit, e.turnId !== undefined)
+  const saved = await saveEdit($, edit, e.turnId !== undefined)
   await closeEdit($)
-  scheduleClear($, e.text)
-  return { drop: reply }
+  if (saved.isApply) scheduleOffer($, EDIT_CLEAR_DELAY_MS, e.text)
+  else scheduleClear($, e.text)
+  return { drop: saved.reply }
 }
 
 /**
@@ -345,27 +334,25 @@ const handleSubmitFailure = async ($: EngineInterface, e: PromptSubmitInput, fai
 
 // ---------------------------------------------------------------- the fill, the status line, the warning
 
-const refreshStatus = async ($: EngineInterface, config: Config): Promise<void> => {
-  if (!config.statusLine) {
+// The statusLine option, as register read it; a reload reads it again.
+let isStatusLineOn = true
+
+const refreshStatus = async ($: EngineInterface): Promise<void> => {
+  if (!isStatusLineOn) {
     $.ui.status(undefined)
     return
   }
-  const [fill, records, pins] = await Promise.all([read($, fillAtom), read($, recordsAtom), read($, pinsAtom)])
-  $.ui.status(`compact-lens: ${fill === null ? '–' : `${fill}%`} · ${plural(records.length, 'compaction')} · ${pins.length} pinned`)
+  const [fill, records, pins, isPending] = await Promise.all([read($, fillAtom), read($, recordsAtom), read($, pinsAtom), read($, pendingApplyAtom)])
+  $.ui.status(statusLineText({ fill, records, pinCount: pins.length, isPending }))
 }
 
 /** The context fill as a percent of the window, from the free usage call; undefined before the first response. */
 const readFill = async ($: EngineInterface): Promise<number | undefined> => {
-  const { context } = await $.session.usage()
-  const percent =
-    context.percent ??
-    (context.tokens === undefined || context.window <= 0 ? undefined : Math.round((100 * context.tokens) / context.window))
+  const percent = fillPercent((await $.session.usage()).context)
   if (percent === undefined) return undefined
   await update($, fillAtom, () => percent)
   return percent
 }
-
-type WarningFigures = { percent: number; thresholdPercent: number | undefined }
 
 /**
  * The fill and the auto-compaction line on one base: the breakdown's compaction window when the
@@ -373,15 +360,7 @@ type WarningFigures = { percent: number; thresholdPercent: number | undefined }
  */
 const warningFigures = async ($: EngineInterface, percent: number): Promise<WarningFigures> => {
   try {
-    const { context } = await $.session.usage({ breakdown: 'summary' })
-    const breakdown = context.breakdown
-    if (breakdown === undefined || breakdown.autoCompactThreshold === undefined || breakdown.rawMaxTokens <= 0) {
-      return { percent, thresholdPercent: undefined }
-    }
-    return {
-      percent: Math.round(breakdown.percentage),
-      thresholdPercent: Math.round((100 * breakdown.autoCompactThreshold) / breakdown.rawMaxTokens),
-    }
+    return figuresOf((await $.session.usage({ breakdown: 'summary' })).context.breakdown, percent)
   } catch {
     return { percent, thresholdPercent: undefined }
   }
@@ -390,7 +369,7 @@ const warningFigures = async ($: EngineInterface, percent: number): Promise<Warn
 /** After a main-loop model step: the fill, the status line, and the one warning per window. */
 const afterStep = async ($: EngineInterface, config: Config): Promise<void> => {
   const percent = await readFill($)
-  await refreshStatus($, config)
+  await refreshStatus($)
   if (percent === undefined || config.warnAtPercent <= 0 || percent < config.warnAtPercent) return
   if ((await read($, warnedAtAtom)) !== null) return
   await update($, warnedAtAtom, () => percent)
@@ -403,7 +382,7 @@ const afterStep = async ($: EngineInterface, config: Config): Promise<void> => {
     await update($, warnedAtAtom, () => null)
     return
   }
-  $.ui.toast(`compact-lens: context at ${figures.percent}%; the model was told where the snapshots go`)
+  $.ui.toast(`context at ${figures.percent}%; the model was told where the snapshots go`)
 }
 
 /** Appends a hidden user-role note; the reason when it could not be. */
@@ -418,14 +397,7 @@ const appendNote = async ($: EngineInterface, text: string): Promise<string | un
 
 // ---------------------------------------------------------------- compaction
 
-type NextCompact = (e: SessionCompactInput) => Promise<SessionCompactResult>
-
-const writeRecord = async (
-  $: EngineInterface,
-  record: CompactLensRecord,
-  files: CompactionFiles,
-  after: readonly SessionMessage[],
-): Promise<void> => {
+const writeRecord = async ($: EngineInterface, record: CompactLensRecord, files: CompactionFiles, after: readonly SessionMessage[]): Promise<void> => {
   const title = `after — compaction #${record.n} (${record.trigger}) at ${record.at}`
   await $.fs.write(files.after, renderTranscript(after, { title, lines: [`${after.length} messages; what the context held right after the compaction.`] }))
   await $.fs.write(files.meta, JSON.stringify(record, null, 2))
@@ -473,19 +445,6 @@ const snapshotBefore = async ($: EngineInterface, messages: readonly SessionMess
   await $.fs.write(files.beforeJson, toJson(messages))
 }
 
-type RecordCompactionArgs = {
-  n: number
-  trigger: CompactLensRecord['trigger']
-  at: string
-  files: CompactionFiles
-  before: readonly SessionMessage[]
-  withSummary: readonly SessionMessage[]
-  summaryIndex: number
-  pins: readonly CompactLensPin[]
-  tokensBefore?: number
-  tokensAfter?: number
-}
-
 /** The summary, the lost report, the record and the note: what every real compaction leaves. */
 const recordCompaction = async ($: EngineInterface, args: RecordCompactionArgs): Promise<SessionMessage[]> => {
   const { n, trigger, at, files, before, withSummary, summaryIndex, pins } = args
@@ -493,7 +452,7 @@ const recordCompaction = async ($: EngineInterface, args: RecordCompactionArgs):
   const lost = computeLost(before, contextText(withSummary))
   const record = buildRecord({ n, trigger, at, files, before, after: withSummary, summary: summary.text, lost, tokensBefore: args.tokensBefore, tokensAfter: args.tokensAfter })
   await $.fs.write(files.summary, summary.text)
-  await $.fs.write(files.lost, renderLost(lost, { n, trigger, at, beforePath: files.before }))
+  await $.fs.write(files.lost, renderLost(lost, { n, trigger, at, beforePath: files.before, tokensBefore: args.tokensBefore }))
   const note = userMessage(buildNote({ record, files, pins, keptCount: withSummary.length - 1 }))
   const messages = insertAfter(withSummary, summaryIndex, note)
   await writeRecord($, record, files, messages)
@@ -528,7 +487,7 @@ const handleReal = async ($: EngineInterface, e: SessionCompactInput, next: Next
 
   const draftNote = edited === undefined ? '' : ', the edited draft.md used as the summary'
   log($, `compaction #${n} (${trigger}): ${e.messages.length} → ${messages.length} messages${draftNote}; snapshots in ${files.dir}`)
-  $.ui.toast(`compact-lens: compaction #${n} recorded in ${files.dir}`)
+  $.ui.toast(`compaction #${n} recorded in ${files.dir}`)
   return { ...result, messages }
 }
 
@@ -551,20 +510,22 @@ const handlePrecompute = async ($: EngineInterface, e: SessionCompactInput, next
   return result
 }
 
-/** An apply: the edited summary.md replaces the current summary; no summariser runs. */
+/** An apply: the edited summary.md replaces the current summary; no summariser runs. A skip drops the waiting edit and says why. */
 const handleApply = async ($: EngineInterface, e: SessionCompactInput, dir: string): Promise<SessionCompactResult> => {
-  await update($, pendingApplyAtom, () => false)
+  const skip = async (reason: string): Promise<SessionCompactResult> => {
+    await setPending($, false)
+    return { skip: `compact-lens: ${reason}; run ${COMPACT_COMMAND} again to compact as usual` }
+  }
   const records = await read($, recordsAtom)
   const latest = records.at(-1)
-  if (latest === undefined) return { skip: 'compact-lens: nothing to apply, no compaction has run yet' }
+  if (latest === undefined) return skip('nothing to apply, no compaction has run yet')
   const current = compactionFiles(dir, latest.n)
-  if (!(await $.fs.exists(current.summary))) return { skip: `compact-lens: ${current.summary} is missing` }
-  const edited = (await $.fs.read(current.summary)).trim()
-  if (edited === '') return { skip: `compact-lens: ${current.summary} is empty` }
-  const index = e.messages.findIndex(m => m.role === 'user' && m.text.startsWith(latest.summaryHead))
-  if (index < 0) return { skip: 'compact-lens: the current summary was not found in the transcript' }
+  const edited = (await $.fs.exists(current.summary)) ? (await $.fs.read(current.summary)).trim() : ''
+  if (edited === '') return skip(`${current.summary} is missing or empty, so nothing was applied`)
+  const index = findRecordedSummary(e.messages, latest)
+  if (index < 0) return skip(`the summary of #${pad2(latest.n)} is not in the conversation now, so the edit was not applied; it stays in ${current.summary}`)
   const old = e.messages[index] ?? userMessage('')
-  if (old.text.trim() === edited) return { skip: `compact-lens: ${current.summary} is unchanged` }
+  if (old.text.trim() === edited) return skip(`${current.summary} is the summary in use, so there was nothing to apply`)
 
   const n = records.length + 1
   const files = compactionFiles(dir, n)
@@ -577,11 +538,16 @@ const handleApply = async ($: EngineInterface, e: SessionCompactInput, dir: stri
   await $.fs.write(files.lost, renderLost(lost, { n, trigger: 'apply', at, beforePath: current.summary }))
   const messages = insertAfter(withSummary, index, userMessage(buildApplyNote(record, files)))
   await writeRecord($, record, files, messages)
+  await setPending($, false)
   log($, `apply #${n}: the summary was replaced from ${current.summary}; snapshots in ${files.dir}`)
+  $.ui.toast(`your edited summary is in place (#${pad2(n)})`)
   return { messages }
 }
 
-/** The session.compact hook: the engine's own compactions are recorded, an apply is answered by the mod. */
+// Set while the hook answers an apply: if it throws, its .catch must skip, never hand the compaction to the summariser.
+let isApplying = false
+
+/** The session.compact hook: the engine's compactions are recorded; the person's /compact with an edit waiting is answered by the mod. */
 const handleCompact = async ($: EngineInterface, e: SessionCompactInput, next: NextCompact): Promise<SessionCompactResult> => {
   if (e.agentId !== undefined) return next(e)
   if (!Array.isArray(e.messages)) {
@@ -591,29 +557,62 @@ const handleCompact = async ($: EngineInterface, e: SessionCompactInput, next: N
   const dir = await read($, sessionDirAtom)
   if (dir === null) return next(e)
   if (e.trigger === 'precompute') return handlePrecompute($, e, next, dir)
-  if (e.trigger === 'plugin' && (await read($, pendingApplyAtom))) return handleApply($, e, dir)
-  return handleReal($, e, next, dir)
+  const isPending = await read($, pendingApplyAtom)
+  if (isPending && e.trigger === 'manual' && (e.instructions ?? '').trim() === '') {
+    isApplying = true
+    const applied = await handleApply($, e, dir)
+    isApplying = false
+    return applied
+  }
+  const result = await handleReal($, e, next, dir)
+  if (isPending && result.skip === undefined) await supersedeApply($)
+  return result
 }
 
 // ---------------------------------------------------------------- the slash command
 
 const statusText = async ($: EngineInterface): Promise<string> => {
-  const [fill, records, pins, dir, isPending] = await Promise.all([
-    read($, fillAtom),
-    read($, recordsAtom),
-    read($, pinsAtom),
-    read($, sessionDirAtom),
-    read($, pendingApplyAtom),
-  ])
+  await syncUnseen($)
+  const [fill, records, pins] = await Promise.all([read($, fillAtom), read($, recordsAtom), read($, pinsAtom)])
+  const [dir, isPending] = await Promise.all([read($, sessionDirAtom), read($, pendingApplyAtom)])
   return formatStatus({ fill, records, pinCount: pins.length, dir, isPending })
 }
 
 const listText = async ($: EngineInterface): Promise<string> => {
+  await syncUnseen($)
   const [records, pins, dir] = await Promise.all([read($, recordsAtom), read($, pinsAtom), read($, sessionDirAtom)])
   return formatList(records, pins, dir)
 }
 
-/** `/compact-lens [verb] [rest]`: the person's side of the mod. */
+/** `show [what] [n]`: a snapshot file printed as the reply, so neither the person nor the model has to open it. */
+const showText = async ($: EngineInterface, tail: string): Promise<string> => {
+  const request = parseShow(tail)
+  if (typeof request === 'string') return request
+  await syncUnseen($)
+  const [records, dir] = await Promise.all([read($, recordsAtom), read($, sessionDirAtom)])
+  const n = request.n ?? records.at(-1)?.n
+  if (dir === null) return 'the snapshot folder is not set'
+  if (request.kind !== 'pinned' && n === undefined) return 'no compaction has run yet, so there is nothing to show'
+  const path = request.kind === 'pinned' ? pinnedFile(dir) : compactionFiles(dir, n ?? 0)[request.kind]
+  return (await $.fs.exists(path)) ? formatShown(path, await $.fs.read(path)) : `${path} does not exist`
+}
+
+/** `apply`: the edited summary.md readied, and /compact offered to apply it. */
+const applyText = async ($: EngineInterface): Promise<string> => {
+  const applicable = await checkApplicable($)
+  if (typeof applicable === 'string') return `nothing to apply: ${applicable}.`
+  await requestApply($)
+  scheduleOffer($, EDIT_FILL_DELAY_MS)
+  return `${applicable.path} is ready. Press Enter on ${COMPACT_COMMAND}, which goes into the prompt box now: the mod answers it with the edited summary, and no summariser runs.`
+}
+
+const cancelText = async ($: EngineInterface): Promise<string> => {
+  if (!(await read($, pendingApplyAtom))) return 'no apply is waiting.'
+  await setPending($, false)
+  return `the waiting apply is dropped; the edit stays in its summary.md, and /${COMMAND} apply readies it again.`
+}
+
+/** `/compact-lens [verb] [rest]`: the person's side of the mod. The engine prints each reply under the plugin's name. */
 const runCommand = async ($: EngineInterface, args: string): Promise<{ text: string }> => {
   const trimmed = args.trim()
   const verb = trimmed.split(/\s+/)[0] ?? ''
@@ -628,28 +627,29 @@ const runCommand = async ($: EngineInterface, args: string): Promise<{ text: str
     }
     case 'edit': {
       const current = await currentSummary($)
-      if (typeof current === 'string') return { text: `compact-lens: ${current}.` }
+      if (typeof current === 'string') return { text: `${current}.` }
       scheduleEdit($)
       return { text: editStarted(current.n) }
     }
+    case 'show':
+      return { text: await showText($, tail) }
     case 'list':
       return { text: await listText($) }
     case 'keep':
     case 'pin': {
-      if (tail === '') return { text: `compact-lens: keep needs a note: /${COMMAND} keep <text>` }
+      if (tail === '') return { text: `keep needs a note: /${COMMAND} keep <text>` }
       const { id, count } = await pin($, tail)
-      return { text: `compact-lens: pinned note ${id} (${count} pinned). It is kept verbatim through every compaction of this session.` }
+      return { text: `pinned note ${id} (${count} pinned). It is kept verbatim through every compaction of this session.` }
     }
     case 'unpin': {
       const id = Number(tail)
-      if (!Number.isInteger(id)) return { text: `compact-lens: unpin needs a number: /${COMMAND} unpin <n>` }
-      return { text: (await unpin($, id)) ? `compact-lens: note ${id} removed.` : `compact-lens: no pinned note ${id}.` }
+      if (!Number.isInteger(id)) return { text: `unpin needs a number: /${COMMAND} unpin <n>` }
+      return { text: (await unpin($, id)) ? `note ${id} removed.` : `no pinned note ${id}.` }
     }
-    case 'apply': {
-      await requestApply($)
-      scheduleApply($)
-      return { text: 'compact-lens: the edited summary.md replaces the summary in a moment, or when the running turn ends.' }
-    }
+    case 'apply':
+      return { text: await applyText($) }
+    case 'cancel':
+      return { text: await cancelText($) }
     default:
       return { text: HELP }
   }
@@ -658,21 +658,20 @@ const runCommand = async ($: EngineInterface, args: string): Promise<{ text: str
 // ---------------------------------------------------------------- the pane
 
 const applyFromPane = async ($: EngineInterface): Promise<void> => {
+  const applicable = await checkApplicable($)
+  if (typeof applicable === 'string') {
+    $.ui.toast(`nothing to apply: ${applicable}`)
+    return
+  }
   await requestApply($)
-  scheduleApply($)
-  $.ui.toast('compact-lens: the edited summary.md replaces the summary in a moment, or when the running turn ends')
+  await offerCompact($)
 }
 
 /** The pane: the fill, the compactions, the pinned notes and the two actions. */
 const renderPane = async ($: EngineInterface, e: RenderInput<'Pane'>) => {
   const { Box, Text, Button } = $.ui.resolve(e)
-  const [records, pins, fill, dir, pending] = await Promise.all([
-    read($, recordsAtom),
-    read($, pinsAtom),
-    read($, fillAtom),
-    read($, sessionDirAtom),
-    read($, pendingApplyAtom),
-  ])
+  const [records, pins, fill] = await Promise.all([read($, recordsAtom), read($, pinsAtom), read($, fillAtom)])
+  const [dir, pending] = await Promise.all([read($, sessionDirAtom), read($, pendingApplyAtom)])
   const shown = records.slice(-SHOWN_RECORDS)
 
   return (
@@ -681,7 +680,7 @@ const renderPane = async ($: EngineInterface, e: RenderInput<'Pane'>) => {
         <Text bold>Compact Lens</Text>
         <Text dimColor>
           context {fill === null ? '–' : `${fill}%`} · {plural(records.length, 'compaction')} · {pins.length} pinned
-          {pending ? ' · apply pending' : ''}
+          {pending ? ` · ${COMPACT_COMMAND} applies the edit` : ''}
         </Text>
         <Text dimColor wrap="truncate-start">
           {dir ?? '(unset)'}
@@ -691,9 +690,7 @@ const renderPane = async ($: EngineInterface, e: RenderInput<'Pane'>) => {
         <Text bold>Compactions</Text>
         {shown.length === 0 && <Text dimColor>none yet</Text>}
         {shown.map(r => (
-          <Text wrap="truncate-end">
-            #{pad2(r.n)} {r.trigger} {r.at.slice(11, 19)} {r.messagesBefore}→{r.messagesAfter} msgs {tokensOf(r)} {r.dir}
-          </Text>
+          <Text wrap="truncate-end">{paneLine(r)}</Text>
         ))}
       </Box>
       <Box flexDirection="column">
@@ -707,7 +704,7 @@ const renderPane = async ($: EngineInterface, e: RenderInput<'Pane'>) => {
       </Box>
       <Box gap={1}>
         <Button key="edit" label="Edit summary" hotkey="e" onPress={() => void startEdit($, EDIT_STARTED_TOAST)} />
-        <Button key="apply" label="Apply summary.md" hotkey="a" onPress={() => void applyFromPane($)} />
+        <Button key="apply" label="Apply summary.md" hotkey="a" onPress={() => void applyFromPane($).catch(error => log($, `apply: ${String(error)}`))} />
         <Button key="refresh" label="Refresh" hotkey="r" onPress={() => void readFill($)} />
         <Button key="close" label="Close" role="dismiss" onPress={() => void $.ui.close({ id: PANE_ID })} />
       </Box>
@@ -719,12 +716,14 @@ const renderPane = async ($: EngineInterface, e: RenderInput<'Pane'>) => {
 
 export const register: Register = (on, options) => {
   const config = readConfig(options)
+  isStatusLineOn = config.statusLine
 
   on('session.start', async ($, e, next) => {
     const home = (await $.env.get('HOME')) ?? ''
     const dir = sessionDirOf(lensRoot(home, config.dir), await $.session.id())
     await update($, sessionDirAtom, () => dir)
     await restore($)
+    await syncUnseen($).catch(error => log($, `a compaction the mod did not see could not be recorded (${String(error)})`))
     await $.tool.register({
       name: 'keep',
       description: KEEP_DESCRIPTION,
@@ -736,14 +735,18 @@ export const register: Register = (on, options) => {
       description: 'Compact Lens: edit the summary, pin notes, open the pane.',
       argumentHint: ARGUMENT_HINT,
     })
-    await refreshStatus($, config)
+    await refreshStatus($)
     if (config.openPane && e.isInteractive) void $.ui.open({ id: PANE_ID, title: 'Compact Lens' })
     return next(e)
   })
 
   on('session.compact', ($, e, next) => handleCompact($, e, next)).catch(($, e, next) => {
-    log($, `the compaction hook failed and stood aside: ${failureText(next.error)}`)
-    return next(e)
+    if (!isApplying || e.trigger !== 'manual' || e.agentId !== undefined) {
+      log($, `the compaction hook failed and stood aside: ${failureText(next.error)}`)
+      return next(e)
+    }
+    isApplying = false
+    return { skip: `compact-lens: the edit could not be applied (${failureText(next.error)}), so nothing changed; it still waits: ${COMPACT_COMMAND} tries again, /${COMMAND} cancel drops it` }
   })
 
   on('turn.step', async function* ($, e, next) {
@@ -754,10 +757,9 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
-    if (e.agentId === undefined && (await read($, pendingApplyAtom))) {
-      const outcome = await applyNow($)
-      log($, `apply at the turn's end: ${outcome.text}`)
-      $.ui.toast(`compact-lens: ${outcome.text}`)
+    if (e.agentId === undefined && isOfferDue) {
+      isOfferDue = false
+      if (await read($, pendingApplyAtom)) await offerCompact($)
     }
     return result
   })
@@ -770,15 +772,17 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => ({ deny: `compact-lens: keep failed: ${failureText(next.error)}` }))
 
   on('tool.call', { tool: 'mcp__compact-lens__apply' }, async $ => {
-    const records = await read($, recordsAtom)
-    const latest = records.at(-1)
-    if (latest === undefined) return { deny: 'compact-lens: no compaction has run yet, so there is no summary to replace' }
+    const applicable = await checkApplicable($)
+    if (typeof applicable === 'string') return { deny: `compact-lens: ${applicable}` }
     await requestApply($)
-    return { result: `The edited ${latest.dir}/summary.md replaces the summary once this turn ends. End the turn to let it run.` }
+    isOfferDue = true
+    return {
+      result: `${applicable.path} is ready. The person applies it with ${COMPACT_COMMAND}: when this turn ends, ${COMPACT_COMMAND} goes into their prompt box, and the mod answers it with the edited summary (no summariser runs; the messages after the summary stay). Tell them to press Enter on it.`,
+    }
   }).catch(($, e, next) => ({ deny: `compact-lens: apply failed: ${failureText(next.error)}` }))
 
   on('command.run', { command: 'compact-lens' }, ($, e) => runCommand($, e.args)).catch(($, e, next) => ({
-    text: `compact-lens: the command failed: ${failureText(next.error)}`,
+    text: `the command failed: ${failureText(next.error)}`,
   }))
 
   on('prompt.submit', ($, e, next) => handleSubmit($, e, next)).catch(($, e, next) => handleSubmitFailure($, e, next.error, next))

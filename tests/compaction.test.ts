@@ -1,6 +1,9 @@
 import { expect, test } from 'claude-code/testing'
 
-import { APPLY, BEFORE, DIR, ENGINE_ANSWER, KEEP, KEPT, SESSION, setup, START, SUMMARY, user } from './kit'
+import { summaryIn } from '../hooks/records'
+import { APPLY, BEFORE, DIR, ENGINE_ANSWER, KEEP, KEPT, last, SESSION, setup, START, SUMMARY, UNSEEN_SUMMARY, user, watchState } from './kit'
+
+const PRESENTATION = { isFullscreen: true, columns: 120 }
 
 test('a compaction is snapshotted, its note inserted after the summary, the kept message untouched', async ($, on) => {
   const world = setup(on)
@@ -101,18 +104,19 @@ test('pins and records are mirrored to the store under the session id', async ($
   expect(held.compactions[0]?.n).toBe(1)
 })
 
-test('apply replaces the summary with the edited summary.md and never calls the summariser', async ($, on) => {
+test("the person's /compact with an edit waiting replaces the summary with summary.md and never calls the summariser", async ($, on) => {
   const world = setup(on)
+  const writes = watchState(on)
   await $.session.start(START)
   const first = await $.session.compact({ trigger: 'auto', messages: BEFORE })
   const current = (first.messages ?? []).map(m => ({ ...m, handle: m.handle ?? `h-${m.text.length}` }))
+  world.transcript = current
   const edited = `${SUMMARY}\n\nEdited by hand: the commit is deadbeef1 and MAX_RETRIES is 5.`
   world.files.set(`${DIR}/01/summary.md`, edited)
 
   const asked = await $.tool.call({ tool: APPLY })
   expect(asked.deny).toBeUndefined()
-  expect(String(asked.result)).toContain(`${DIR}/01/summary.md`)
-  const applied = await $.session.compact({ trigger: 'plugin', messages: current })
+  const applied = await $.session.compact({ trigger: 'manual', messages: current })
 
   expect(applied.skip).toBeUndefined()
   const messages = applied.messages ?? []
@@ -124,24 +128,78 @@ test('apply replaces the summary with the edited summary.md and never calls the 
   expect(world.compactions).toBe(1)
   expect(world.files.get(`${DIR}/02/summary.md`)).toBe(edited)
   expect(JSON.parse(world.files.get(`${DIR}/02/meta.json`) ?? '{}').trigger).toBe('apply')
+  expect(last(writes, 'pendingApply')).toBe(false)
+  expect(world.toasts.at(-1)).toContain('your edited summary is in place (#02)')
 })
 
-test('apply with nothing to apply, or an unchanged file, skips and says why', async ($, on) => {
+test('a waiting edit reverted before /compact is skipped, and an automatic or plugin compaction runs over it and drops it', async ($, on) => {
   const world = setup(on)
+  const writes = watchState(on)
   await $.session.start(START)
-
-  const nothing = await $.tool.call({ tool: APPLY })
-  expect(nothing.deny).toContain('no compaction has run yet')
-
   const first = await $.session.compact({ trigger: 'auto', messages: BEFORE })
+  world.transcript = [...(first.messages ?? [])]
+  world.files.set(`${DIR}/01/summary.md`, `${SUMMARY}\nEdited.`)
   await $.tool.call({ tool: APPLY })
-  const unchanged = await $.session.compact({ trigger: 'plugin', messages: first.messages ?? [] })
-  expect(unchanged.skip).toContain('unchanged')
+  world.files.set(`${DIR}/01/summary.md`, SUMMARY)
+
+  const reverted = await $.session.compact({ trigger: 'manual', messages: first.messages ?? [] })
+  expect(reverted.skip).toContain('is the summary in use')
+  expect(last(writes, 'pendingApply')).toBe(false)
   expect(world.compactions).toBe(1)
 
-  const plain = await $.session.compact({ trigger: 'plugin', messages: BEFORE })
-  expect(plain.skip).toBeUndefined()
+  world.files.set(`${DIR}/01/summary.md`, `${SUMMARY}\nEdited again.`)
+  await $.tool.call({ tool: APPLY })
+  const auto = await $.session.compact({ trigger: 'auto', messages: first.messages ?? [] })
+  expect(auto.skip).toBeUndefined()
   expect(world.compactions).toBe(2)
+  expect(last(writes, 'pendingApply')).toBe(false)
+  expect(world.toasts.at(-1)).toContain('a compaction ran before the edited summary was applied')
+
+  world.files.set(`${DIR}/02/summary.md`, `${SUMMARY}\nA third edit.`)
+  world.transcript = [...(auto.messages ?? [])]
+  await $.tool.call({ tool: APPLY })
+  await $.session.compact({ trigger: 'plugin', messages: auto.messages ?? [] })
+  expect(world.compactions).toBe(3)
+  expect(last(writes, 'pendingApply')).toBe(false)
+})
+
+test('a summary the conversation runs on but the mod never recorded is adopted as an unseen compaction, once', async ($, on) => {
+  const world = setup(on)
+  await $.session.start(START)
+  world.transcript = [user(UNSEEN_SUMMARY, 'h-u'), KEPT, user('and then a prompt', 'h-p')]
+
+  const listed = await $.command.run({ command: 'compact-lens', args: 'list', origin: { kind: 'composer' }, presentation: PRESENTATION })
+  const again = await $.command.run({ command: 'compact-lens', args: 'list', origin: { kind: 'composer' }, presentation: PRESENTATION })
+
+  expect(listed.text).toContain('compactions (1):')
+  expect(listed.text).toContain('#1 unseen')
+  expect(again.text).toContain('compactions (1):')
+  expect(world.files.get(`${DIR}/01/summary.md`)).toBe(UNSEEN_SUMMARY)
+  expect(world.files.get(`${DIR}/01/before.md`)).toContain('did not see this compaction run')
+  expect(world.files.get(`${DIR}/01/after.md`)).toContain('and then a prompt')
+  const meta = JSON.parse(world.files.get(`${DIR}/01/meta.json`) ?? '{}')
+  expect(meta.trigger).toBe('unseen')
+  expect(meta.messagesAfter).toBe(3)
+
+  world.files.set(`${DIR}/01/summary.md`, `${UNSEEN_SUMMARY} Edited.`)
+  await $.tool.call({ tool: APPLY })
+  const applied = await $.session.compact({ trigger: 'manual', messages: world.transcript })
+  expect(applied.messages?.[0]?.text).toBe(`${UNSEEN_SUMMARY} Edited.`)
+  expect(world.compactions).toBe(0)
+})
+
+test('a recorded summary is never adopted again, and a conversation with no summary adopts nothing', async ($, on) => {
+  const world = setup(on)
+  await $.session.start(START)
+  world.transcript = [...BEFORE]
+  const none = await $.command.run({ command: 'compact-lens', args: 'list', origin: { kind: 'composer' }, presentation: PRESENTATION })
+  expect(none.text).toContain('compactions (0):')
+
+  const first = await $.session.compact({ trigger: 'auto', messages: BEFORE })
+  world.transcript = [...(first.messages ?? [])]
+  const one = await $.command.run({ command: 'compact-lens', args: 'list', origin: { kind: 'composer' }, presentation: PRESENTATION })
+  expect(one.text).toContain('compactions (1):')
+  expect(one.text).not.toContain('unseen')
 })
 
 test('a precomputed summary is kept as a draft, and an edited draft becomes the summary when the engine reuses it', async ($, on) => {
@@ -209,4 +267,92 @@ test('the system prompt gets the Compact Lens section only where the keep tool i
   await $.session.compact({ trigger: 'auto', messages: BEFORE })
   const after = await compose(['Read', KEEP])
   expect(after.sections[1]?.text).toContain(`Compactions so far: 1; latest: ${DIR}/01`)
+})
+
+test('with an edit waiting, a /compact that carries instructions compacts as usual and drops the edit', async ($, on) => {
+  const world = setup(on)
+  const writes = watchState(on)
+  await $.session.start(START)
+  const first = await $.session.compact({ trigger: 'auto', messages: BEFORE })
+  world.transcript = [...(first.messages ?? [])]
+  world.files.set(`${DIR}/01/summary.md`, `${SUMMARY}\nEdited.`)
+  await $.tool.call({ tool: APPLY })
+  expect(world.status).toContain('/compact applies the edit')
+
+  const result = await $.session.compact({ trigger: 'manual', messages: first.messages ?? [], instructions: 'focus on the tests' })
+
+  expect(result.skip).toBeUndefined()
+  expect(world.compactions).toBe(2)
+  expect(world.instructions.at(-1)).toBe('focus on the tests')
+  expect(last(writes, 'pendingApply')).toBe(false)
+  expect(world.status).not.toContain('applies the edit')
+})
+
+test('an apply that fails part way skips the compaction and keeps the edit waiting; the summariser never runs', async ($, on) => {
+  let isDiskFull = false
+  const world = setup(on, { failWrite: path => isDiskFull && path === `${DIR}/02/before.md` })
+  const writes = watchState(on)
+  await $.session.start(START)
+  const first = await $.session.compact({ trigger: 'auto', messages: BEFORE })
+  world.transcript = [...(first.messages ?? [])]
+  world.files.set(`${DIR}/01/summary.md`, `${SUMMARY}\nEdited.`)
+  await $.tool.call({ tool: APPLY })
+  isDiskFull = true
+
+  const failed = await $.session.compact({ trigger: 'manual', messages: first.messages ?? [] })
+
+  expect(failed.skip).toContain('the edit could not be applied')
+  expect(failed.skip).toContain('it still waits')
+  expect(world.compactions).toBe(1)
+  expect(last(writes, 'pendingApply')).toBe(true)
+  isDiskFull = false
+  const retried = await $.session.compact({ trigger: 'manual', messages: first.messages ?? [] })
+  expect(retried.messages?.[0]?.text).toBe(`${SUMMARY}\nEdited.`)
+  expect(world.compactions).toBe(1)
+})
+
+test('the apply replaces the summary itself: not a later prompt that pastes it, and not a newer summary that shares its opening', async ($, on) => {
+  const world = setup(on)
+  await $.session.start(START)
+  const first = await $.session.compact({ trigger: 'auto', messages: BEFORE })
+  const pasted = user(`${SUMMARY} And remember port 9999.`, 'h-paste')
+  const current = [...(first.messages ?? []), pasted]
+  world.transcript = current
+  world.files.set(`${DIR}/01/summary.md`, `${SUMMARY}\nEdited.`)
+  await $.tool.call({ tool: APPLY })
+
+  const applied = await $.session.compact({ trigger: 'manual', messages: current })
+  expect(applied.messages?.[0]?.text).toBe(`${SUMMARY}\nEdited.`)
+  expect(applied.messages?.at(-1)).toEqual(pasted)
+
+  const newer = user(`${SUMMARY} A newer summary the mod never saw opens the same way, with other facts.`, 'h-new')
+  world.transcript = [newer, KEPT]
+  const listed = await $.command.run({ command: 'compact-lens', args: 'list', origin: { kind: 'composer' }, presentation: PRESENTATION })
+  expect(listed.text).toContain('#3 unseen')
+})
+
+test("a prompt that opens like a summary is never taken for one: the summary is the next request's first message", async ($, on) => {
+  const world = setup(on)
+  await $.session.start(START)
+  const first = await $.session.compact({ trigger: 'auto', messages: BEFORE })
+  world.transcript = [...(first.messages ?? []), user(`${UNSEEN_SUMMARY} My own rewrite, sent as a prompt.`, 'h-mine')]
+
+  const listed = await $.command.run({ command: 'compact-lens', args: 'list', origin: { kind: 'composer' }, presentation: PRESENTATION })
+
+  expect(listed.text).toContain('compactions (1):')
+  expect(listed.text).not.toContain('unseen')
+})
+
+const api = (role: 'user' | 'assistant', ...texts: string[]) => ({ role, content: texts.map(text => ({ type: 'text', text })) })
+
+test("the summary in use is the first opening block that opens as one: after a reminder or a context message, and without the mod's note merged into it", async () => {
+  const rows = [user(UNSEEN_SUMMARY, 'h-s'), user('<compact-lens n="1">note</compact-lens>', 'h-n'), KEPT]
+
+  expect(summaryIn([api('user', '<system-reminder>context</system-reminder>', UNSEEN_SUMMARY), api('assistant', 'x')], rows, [])).toBe(UNSEEN_SUMMARY)
+  expect(summaryIn([api('user', 'a context message'), api('user', UNSEEN_SUMMARY), api('assistant', 'x')], rows, [])).toBe(UNSEEN_SUMMARY)
+  expect(summaryIn([api('user', `${UNSEEN_SUMMARY}\n\n<compact-lens n="1">note</compact-lens>`)], rows, [])).toBe(UNSEEN_SUMMARY)
+  expect(summaryIn([api('user', UNSEEN_SUMMARY, `${UNSEEN_SUMMARY} sent again as a prompt`)], rows, [])).toBe(UNSEEN_SUMMARY)
+  expect(summaryIn([api('user', 'hello'), api('assistant', 'hi'), api('user', UNSEEN_SUMMARY)], rows, [])).toBeUndefined()
+  expect(summaryIn([api('user', 'Edited opening.\nmore')], [], ['Edited opening.'])).toBe('Edited opening.\nmore')
+  expect(summaryIn([], rows, [])).toBeUndefined()
 })

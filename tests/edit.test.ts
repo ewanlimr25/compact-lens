@@ -2,8 +2,8 @@ import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
 import { buildEditDraft, editHeader, fileStamp, judgeEdit, looksLikeEdit, parseEditHeader } from '../hooks/editor'
-import { APPLY_DELAY_MS, EDIT_CLEAR_DELAY_MS, EDIT_FILL_DELAY_MS } from '../hooks/paths'
-import { BEFORE, DIR, KEPT, last, setup, START, SUMMARY, user, watchState } from './kit'
+import { EDIT_CLEAR_DELAY_MS, EDIT_FILL_DELAY_MS } from '../hooks/paths'
+import { BEFORE, DIR, KEPT, last, setup, START, SUMMARY, UNSEEN_SUMMARY, user, watchState } from './kit'
 
 const PRESENTATION = { isFullscreen: true, columns: 120 }
 const STAMP = '20231114-221320-000'
@@ -60,6 +60,8 @@ test('the header is found with trailing spaces or wrapped by an editor, and a su
   expect(judgeEdit({ n: 1, body: 'x' }, undefined)).toBe('none')
   expect(judgeEdit({ n: 1, body: 'x' }, 2)).toBe('stale')
   expect(judgeEdit({ n: 2, body: 'x' }, 2)).toBe('apply')
+  expect(judgeEdit({ n: 2, body: 'x' }, 2, '  x\n')).toBe('unchanged')
+  expect(judgeEdit({ n: 2, body: 'x' }, 2, 'y')).toBe('apply')
   expect(fileStamp('2026-10-07T13:53:42.706Z')).toBe('20261007-135342-706')
 })
 
@@ -92,11 +94,12 @@ test('/compact-lens edit puts the summary in the prompt box under its dimmed hea
   expect(last(writes, 'editing')).toBe(1)
 })
 
-test('Enter on the edited summary saves it, never reaches the model, applies it, and empties a box the engine refilled', async ($, on) => {
+test('Enter on the edited summary saves it, never reaches the model, puts /compact where the engine refilled the box, and /compact applies it', async ($, on) => {
   const world = setup(on)
   const writes = watchState(on)
   await $.session.start(START)
-  await $.session.compact({ trigger: 'auto', messages: BEFORE })
+  const first = await $.session.compact({ trigger: 'auto', messages: BEFORE })
+  world.transcript = [...(first.messages ?? [])]
   await openEdit($, world)
   const edited = `${SUMMARY}\nEdited in the box: the port is 8080.`
   const sent = `${editHeader(1)} \n${edited}\n`
@@ -105,16 +108,50 @@ test('Enter on the edited summary saves it, never reaches the model, applies it,
   world.box = sent
 
   expect(result.drop).toContain(`${DIR}/01/summary.md`)
-  expect(result.drop).toContain('in a moment')
+  expect(result.drop).toContain('press Enter on /compact in the prompt box:')
   expect(result.drop).toContain('not sent to the model')
   expect(world.submitted).toEqual([])
   expect(world.files.get(`${DIR}/01/summary.md`)).toBe(edited)
   expect(last(writes, 'pendingApply')).toBe(true)
   expect(last(writes, 'editing')).toBe(null)
+  await world.clock.advance(EDIT_CLEAR_DELAY_MS)
+  expect(world.box).toBe('/compact ')
+  expect(world.toasts.at(-1)).toContain('Enter applies the edited summary')
+
+  const applied = await $.session.compact({ trigger: 'manual', messages: first.messages ?? [] })
+  expect(applied.messages?.[0]?.text).toBe(edited)
   expect(world.compactions).toBe(1)
-  await world.clock.advance(APPLY_DELAY_MS)
-  expect(world.compactions).toBe(2)
+  expect(last(writes, 'pendingApply')).toBe(false)
+})
+
+test('an edit left as it was applies nothing and asks for no /compact', async ($, on) => {
+  const world = setup(on)
+  const writes = watchState(on)
+  await $.session.start(START)
+  const first = await $.session.compact({ trigger: 'auto', messages: BEFORE })
+  world.transcript = [...(first.messages ?? [])]
+  await openEdit($, world)
+
+  const result = await submit($, world, world.box)
+  await world.clock.advance(EDIT_CLEAR_DELAY_MS)
+
+  expect(result.drop).toContain('is the one in use, so there is nothing to apply.')
+  expect(writes.some(w => w.key === 'pendingApply' && w.value === true)).toBe(false)
   expect(world.box).toBe('')
+  expect(world.submitted).toEqual([])
+})
+
+test('edit offers the summary the conversation runs on when the mod never saw the compaction that wrote it', async ($, on) => {
+  const world = setup(on)
+  await $.session.start(START)
+  world.transcript = [user(UNSEEN_SUMMARY, 'h-u'), KEPT]
+
+  const reply = await runEdit($)
+  await world.clock.advance(EDIT_FILL_DELAY_MS)
+
+  expect(reply.text).toContain('compaction #01')
+  expect(reply.text?.startsWith("compact-lens:")).toBe(false)
+  expect(world.box).toBe(buildEditDraft(1, UNSEEN_SUMMARY))
 })
 
 test('the box is emptied only when it holds the caught prompt, and an edit sent during a turn waits for its end', async ($, on) => {
@@ -127,8 +164,9 @@ test('the box is emptied only when it holds the caught prompt, and an edit sent 
   world.box = 'a new prompt typed at once'
   await world.clock.advance(EDIT_CLEAR_DELAY_MS)
 
-  expect(result.drop).toContain('when the running turn ends')
+  expect(result.drop).toContain('once the running turn has ended')
   expect(world.box).toBe('a new prompt typed at once')
+  expect(world.toasts.at(-1)).toContain('run /compact to apply')
 })
 
 test('a deleted header is caught while the edit is open, another session summary is not, and an ordinary prompt closes the edit', async ($, on) => {
@@ -189,7 +227,7 @@ test('an empty edit applies nothing, and an edit of an older compaction, or with
 
   const empty = await submit($, world, `${editHeader(2)}\n   `)
   const stale = await submit($, world, `${editHeader(1)}\nan old edit`)
-  await world.clock.advance(APPLY_DELAY_MS)
+  await world.clock.advance(EDIT_CLEAR_DELAY_MS)
 
   expect(none.drop).toContain('no compaction has run')
   expect(empty.drop).toContain('empty')
@@ -278,4 +316,24 @@ test("the pane's Edit summary button puts the summary in the box at once", async
   expect(world.box).toBe(buildEditDraft(1, SUMMARY))
   expect(world.toasts.at(-1)).toContain('the summary is in the prompt box')
   await ui.unmount()
+})
+
+test('an edit put back to the summary in use drops an apply that waited with other text, and restores summary.md', async ($, on) => {
+  const world = setup(on)
+  const writes = watchState(on)
+  await $.session.start(START)
+  const first = await $.session.compact({ trigger: 'auto', messages: BEFORE })
+  world.transcript = [...(first.messages ?? [])]
+  world.files.set(`${DIR}/01/summary.md`, `${SUMMARY}\nThe model's edit.`)
+  await $.tool.call({ tool: 'mcp__compact-lens__apply' })
+  expect(last(writes, 'pendingApply')).toBe(true)
+
+  const result = await submit($, world, `${editHeader(1)}\n${SUMMARY}`)
+  const compacted = await $.session.compact({ trigger: 'manual', messages: first.messages ?? [] })
+
+  expect(result.drop).toContain('the apply that waited with other text is dropped')
+  expect(world.files.get(`${DIR}/01/summary.md`)).toBe(SUMMARY)
+  expect(last(writes, 'pendingApply')).toBe(false)
+  expect(compacted.messages?.[0]?.text).toBe(SUMMARY)
+  expect(world.compactions).toBe(2)
 })

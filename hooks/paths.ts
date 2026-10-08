@@ -21,12 +21,17 @@ export const IDENTIFIER_CAP = 200
 export const LIST_CAP = 150
 /** How many characters of the summary a record keeps, to find the summary again. */
 export const SUMMARY_HEAD_CHARS = 400
-/** How long after a turn ends an apply the model asked for is tried, and how often. */
-export const APPLY_DELAY_MS = 1500
-export const APPLY_RETRIES = 6
-/** How long after the command, or the pane's button, the summary goes into the prompt box: the engine empties the box on Enter first. */
+/** The person's command an apply rides on: with an edit waiting, the mod answers it with the edit and no summariser runs. */
+export const COMPACT_COMMAND = '/compact'
+/** What goes in the prompt box: the trailing space closes the slash-command typeahead, so Enter runs /compact and not /compact-lens. */
+export const COMPACT_FILL = `${COMPACT_COMMAND} `
+/** How the engine's summary opens: a summary the mod did not record is found by it. */
+export const ENGINE_SUMMARY_OPENING = 'This session is being continued from a previous conversation'
+/** How many characters of a file `/compact-lens show` prints; the rest stays in the file. */
+export const SHOW_CAP = 20000
+/** How long after the command, or the pane's button, the summary (or /compact) goes into the prompt box: the engine empties the box on Enter first. */
 export const EDIT_FILL_DELAY_MS = 250
-/** How long after a caught edit the mod looks at the prompt box, and empties it if the engine put the edit back. */
+/** How long after a caught edit the mod looks at the prompt box, to put /compact there or empty it if the engine put the edit back. */
 export const EDIT_CLEAR_DELAY_MS = 300
 /** How many characters of a short summary's opening identify an edit whose header line was deleted. */
 export const EDIT_HEAD_PROBE_CHARS = 80

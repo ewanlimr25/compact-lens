@@ -57,6 +57,10 @@ export type World = {
   submitted: string[]
   toasts: string[]
   clock: MockClock
+  /** What `$.session.messages()` answers: the conversation as the engine holds it now. Empty until a test sets it. */
+  transcript: SessionMessage[]
+  /** The status line under the prompt, as the plugin last set it. */
+  status: string | undefined
 }
 
 export type SetupOptions = {
@@ -75,7 +79,7 @@ export const ENGINE_ANSWER = (): SessionCompactResult => ({ messages: [user(SUMM
 /** The engine beneath the plugin: env, store, clock, files in memory, and the registrations. */
 export const setup = (on: On, options: SetupOptions = {}): World => {
   const clock = mock.clock(on, { now: 1_700_000_000_000 })
-  const world: World = { files: new Map(), appended: [], compactions: 0, instructions: [], box: '', fills: [], submitted: [], toasts: [], clock }
+  const world: World = { files: new Map(), appended: [], compactions: 0, instructions: [], box: '', fills: [], submitted: [], toasts: [], clock, transcript: [], status: undefined }
   mock.env(on, { HOME })
   if (options.store !== false) mock.store(on)
   on('session.id', () => ({ value: SESSION }))
@@ -104,6 +108,14 @@ export const setup = (on: On, options: SetupOptions = {}): World => {
     world.instructions.push(e.instructions)
     return options.answer === undefined ? ENGINE_ANSWER() : options.answer(e)
   })
+  // The rows, or the next request's messages: each message's text as one block (the engine merges and adds reminders; enough here).
+  on('session.messages', ($, e) => ({
+    value: e.as === 'api' ? world.transcript.map(m => ({ role: m.role, content: m.text === '' ? [] : [{ type: 'text', text: m.text }] })) : world.transcript,
+  }))
+  on('ui.status', ($, e) => {
+    world.status = e.text
+    return { value: undefined }
+  })
   on('prompt.read', () => ({ value: { text: world.box, cursor: world.box.length } }))
   on('prompt.fill', ($, e) => {
     if (options.fillRefusal !== undefined) return { isFilled: false, refusal: options.fillRefusal }
@@ -124,6 +136,9 @@ export const setup = (on: On, options: SetupOptions = {}): World => {
   })
   return world
 }
+
+/** The engine's summary of a compaction compact-lens did not see: it opens as every engine summary does. */
+export const UNSEEN_SUMMARY = 'This session is being continued from a previous conversation that ran out of context. Summary: the release went out as v2.'
 
 export const START = { cwd: '/repo', surface: 'terminal', isInteractive: true } as const
 

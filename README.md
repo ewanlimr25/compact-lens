@@ -17,7 +17,7 @@ a folder under `~/.claude/compact-lens/<session-id>/<nn>/`:
 | `before.json` | the same, raw and uncut |
 | `summary.md` | the summary's text, exactly; edit it and apply it (below) |
 | `after.md` | what the context held right after: the summary and the kept messages |
-| `lost.md` | what the summary does not mention: the person's prompts verbatim, files edited and read, commands run, agents spawned, and the paths, hashes, URLs, code spans and constants of the compacted span that the context after it no longer holds |
+| `lost.md` | what the summary does not mention: the person's prompts verbatim, the slash commands they ran, files edited and read (by Read, and by `cat`, `head`, `sed` and the like in Bash), commands run, agents spawned, and the paths, hashes, URLs, code spans and constants of the compacted span that the context after it no longer holds |
 | `meta.json` | the record: trigger, time, message counts, token counts |
 
 Right after the summary, the mod inserts one user-role note the model reads: the counts, the three
@@ -33,23 +33,42 @@ can pin facts. Once per window; a compaction re-arms it.
 `/compact-lens keep <text>`. Pinned notes go into the summariser's instructions ("keep these
 verbatim") and, whatever the summariser does, verbatim into the note after the summary.
 
+**Seeing it in the session.** `/compact-lens show` prints the latest `lost.md`;
+`/compact-lens show after`, `show summary 2`, `show before`, `show pinned` print the others (cut at
+20,000 characters; the file keeps the rest). The reply lands in the transcript, so the model reads
+it too.
+
 **Editing the summary afterwards, in the session.** Run `/compact-lens edit`, or press "Edit
-summary" in the pane. The latest summary goes into your prompt box under a dim header line. Edit
-it there, or press ctrl+g to edit it in your own editor, then press Enter: the mod catches that
-prompt before the model sees it, saves it to `<nn>/summary.md` and applies it. An empty box
-cancels. If the box already holds a draft of yours, the mod leaves it alone and says so. An edit
-of an older summary, made before a newer compaction ran, is kept in `<nn>/edit-unapplied.md`
-rather than applied.
+summary" in the pane. The summary the conversation runs on goes into your prompt box under a dim
+header line. Edit it there, or press ctrl+g to edit it in your own editor, then press Enter: the
+mod catches that prompt before the model sees it and saves it to `<nn>/summary.md`, then puts
+`/compact` in the prompt box. Press Enter on that `/compact` to apply the edit. An empty box
+cancels; an edit left as it was applies nothing. If the box already holds a draft of yours, the
+mod leaves it alone and says so. An edit of an older summary, made before a newer compaction ran,
+is kept in `<nn>/edit-unapplied-<time>.md` rather than applied.
 
 **Editing the summary file.** Edit `<nn>/summary.md` yourself, or ask the model to, then:
 
-- the model calls `mcp__compact-lens__apply`: the replacement runs when its turn ends;
-- or you run `/compact-lens apply`, or press "Apply summary.md" in the pane: it runs in a
-  moment, or when the running turn ends.
+- the model calls `mcp__compact-lens__apply`: when its turn ends, `/compact` goes into your
+  prompt box;
+- or you run `/compact-lens apply`, or press "Apply summary.md" in the pane: `/compact` goes into
+  the prompt box at once.
 
-The replacement is a plugin-triggered compaction that the mod's own hook answers: the current
-summary message is swapped for the file's text, every message after it is kept as it is, and no
-summariser runs. It is recorded as the next numbered folder with trigger `apply`.
+Press Enter on `/compact`. While an edit waits, the mod answers a `/compact` with nothing after it
+itself: the current summary message is swapped for the file's text, every message after it is
+kept as it is, and no summariser runs. It is recorded as the next numbered folder with trigger
+`apply`. The status line says when an edit waits. `/compact-lens cancel` drops it; so does a
+`/compact` with instructions after it, or an automatic compaction, which compact as usual (the
+edit stays in its file). If the apply fails part way, nothing changes and the edit keeps waiting.
+
+Why `/compact` and not a button that applies at once: the engine never shows a plugin's own
+`$.session.compact()` to that plugin's `session.compact` hook, so a mod cannot answer a compaction
+it asked for; the engine's summariser would run instead. Your `/compact` reaches the hook.
+
+**A compaction the mod did not see** (one that ran while the mod was reloading or not loaded) is
+recorded when the mod next looks (at session start, and on `edit`, `show`, `list`, `apply`): its
+summary and what followed it, under trigger `unseen`. Its transcript was not seen, so `before.md`
+and `lost.md` say so; the session's own transcript file still holds it.
 
 **A precomputed summary** (the engine drafting one ahead of time) is written to `draft.md`. If
 you edit it before the compaction lands and the engine reuses the draft, your edit becomes the
@@ -57,7 +76,8 @@ summary.
 
 **The pane.** `/compact-lens` opens it: the fill, the compactions, the pinned notes, and the
 edit, apply and refresh buttons. `/compact-lens list` prints the same as text. A status line under the
-prompt reads `compact-lens: 72% · 1 compaction · 2 pinned`.
+prompt reads `compact-lens: 72% · 1 compaction · 2 pinned`, and adds `· /compact applies the edit`
+while an edit waits.
 
 Subagent compactions pass through untouched.
 

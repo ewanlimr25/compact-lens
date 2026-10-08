@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
-import { computeLost, extractIdentifiers, mergeSubstrings, renderLost } from '../hooks/lost'
-import { BEFORE, SUMMARY } from './kit'
+import { bashReads, computeLost, extractIdentifiers, mergeSubstrings, renderLost } from '../hooks/lost'
+import { assistant, BEFORE, SUMMARY, user } from './kit'
 
 test('identifiers are paths, hashes, URLs, code spans, constants and references, and short or numeric ones are dropped', async () => {
   const counts = extractIdentifiers(
@@ -90,4 +90,50 @@ test('a prompt made only of system reminders is not a prompt, and tool results a
 
   expect(report.prompts.length).toBe(0)
   expect(report.identifiersLost.length).toBe(0)
+})
+
+test("slash commands and their output are not counted as the person's prompts, and are listed as commands with their arguments", async () => {
+  const report = computeLost(
+    [
+      user('<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>opus</command-args>', 'c1'),
+      user('<local-command-stdout>Set model to opus</local-command-stdout>', 'c2'),
+      user('<command-message>plugin-authoring</command-message>\n<command-name>/plugin-authoring</command-name>\n<command-args>see if it is built</command-args>', 'c3'),
+      user('Base directory for this skill: /tmp/skills/plugin-authoring\n\nWHERE TO WRITE IT.', 'c4'),
+      user('<command-name>/effort</command-name>\n<command-args></command-args>', 'c5'),
+      user('the one real prompt', 'c6'),
+    ],
+    '',
+  )
+
+  expect(report.prompts).toEqual(['the one real prompt'])
+  expect(report.slashCommands).toEqual(['/model opus', '/plugin-authoring see if it is built', '/effort'])
+  const text = renderLost(report, { n: 1, trigger: 'manual', at: 't', beforePath: 'b' })
+  expect(text).toContain('slash commands: 3')
+  expect(text).toContain('- /plugin-authoring see if it is built')
+})
+
+test('files read with cat, head or sed in Bash are listed with the Read files; flags, patterns, variables and /dev are not', async () => {
+  expect(bashReads("cd ~/repo && sed -n '1,124p' hooks/register.tsx | head -5; cat /etc/hosts 2>/dev/null")).toEqual(['hooks/register.tsx', '/etc/hosts'])
+  expect(bashReads('grep -n "a b" src/x.ts README.md')).toEqual(['src/x.ts', 'README.md'])
+  expect(bashReads('cat $J; wc -l hooks/*.ts; head -c 600 /dev/null')).toEqual([])
+  expect(bashReads('git status && npm test src/app.ts')).toEqual([])
+  expect(bashReads("cat <<'EOF' > /repo/notes/plan.md\nhead of the plan: README.md first\nEOF")).toEqual([])
+  expect(bashReads('cat src/a.ts > src/b.ts; sed -i "" s/a/b/ src/c.ts; grep -rn TODO src/')).toEqual(['src/a.ts'])
+
+  const report = computeLost(
+    [assistant('Reading.', 'a1', [{ tool_use_id: 'b1', tool: 'Bash', input: { command: 'cat notes/plan.md && tail -n 5 /var/log/app.log' }, text: 'x' }])],
+    '',
+  )
+  expect(report.filesRead).toEqual(['notes/plan.md', '/var/log/app.log'])
+})
+
+test("the size line gives the engine's token count when it has one, and the estimate otherwise", async () => {
+  const report = computeLost(BEFORE, SUMMARY)
+  const counted = renderLost(report, { n: 1, trigger: 'manual', at: 't', beforePath: 'b', tokensBefore: 409151 })
+  const estimated = renderLost(report, { n: 1, trigger: 'manual', at: 't', beforePath: 'b' })
+
+  expect(counted).toContain("409k tokens by the engine's count")
+  expect(estimated).toContain('tokens (')
+  expect(estimated).toContain('at 4 a token')
+  expect(estimated).not.toContain("engine's count")
 })

@@ -1,6 +1,6 @@
 {
   "name": "compact-lens",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "See what a compaction takes away and what it leaves, pin facts that must survive it, and edit the summary afterwards.",
   "author": {
     "name": "Ewan"

@@ -98,47 +98,55 @@ test('the pane draws the status, the compactions and the pins on each surface', 
   }
 })
 
-// The kit hands a plugin's own `$.session.compact()` an empty input (the engine fills the trigger and
-// the transcript in a session), so this checks the dispatch at the turn's end; the replacement itself
-// is checked above with the engine's shape, and in a live session.
-test("the model's apply waits for the turn's end, then asks the engine for a compaction", async ($, on) => {
+const MAIN_END = { answer: 'done', durationMs: 5, isAborted: false, turnId: 't1', reason: 'answer' } as const
+
+// The engine never shows a plugin's own $.session.compact() to that plugin's session.compact hook,
+// so the model's apply asks for no compaction: it readies the edit, and the person's /compact applies it.
+test("the model's apply readies the edit and, when its turn ends, puts /compact in the person's box; nothing compacts", async ($, on) => {
   const world = setup(on)
   const writes = watchState(on)
   on('turn.complete', ($, e) => ({ text: e.answer }))
   await $.session.start(START)
-  await $.session.compact({ trigger: 'auto', messages: BEFORE })
+  const first = await $.session.compact({ trigger: 'auto', messages: BEFORE })
+  world.transcript = [...(first.messages ?? [])]
   world.files.set(`${DIR}/01/summary.md`, `${SUMMARY}\nEdited.`)
-  expect(world.compactions).toBe(1)
 
-  await $.tool.call({ tool: APPLY })
+  const asked = await $.tool.call({ tool: APPLY })
+  expect(asked.deny).toBeUndefined()
+  expect(String(asked.result)).toContain(`${DIR}/01/summary.md is ready`)
+  expect(String(asked.result)).toContain('press Enter on it')
   expect(last(writes, 'pendingApply')).toBe(true)
-  const quiet = await $.turn.complete({ answer: 'sub', durationMs: 5, isAborted: false, turnId: 't0', reason: 'answer', agentId: 'agent-1' })
-  expect(quiet.text).toBe('sub')
-  expect(world.compactions).toBe(1)
-  const done = await $.turn.complete({ answer: 'done', durationMs: 5, isAborted: false, turnId: 't1', reason: 'answer' })
+  await $.turn.complete({ ...MAIN_END, answer: 'sub', agentId: 'agent-1' })
+  expect(world.box).toBe('')
+  const done = await $.turn.complete(MAIN_END)
 
   expect(done.text).toBe('done')
-  expect(world.compactions).toBe(2)
-  expect(last(writes, 'pendingApply')).toBe(true)
-  expect(last(writes, 'warnedAt')).toBe(null)
+  expect(world.box).toBe('/compact ')
+  expect(world.toasts.at(-1)).toContain('Enter applies the edited summary')
+  expect(world.compactions).toBe(1)
+  world.box = ''
+  await $.turn.complete(MAIN_END)
+  expect(world.box).toBe('')
 })
 
-test('two routes asking for the apply at once share one run', async ($, on) => {
+test("the model's apply is refused before any compaction and while summary.md is the summary in use, and a busy box is left alone", async ($, on) => {
   const world = setup(on)
+  const writes = watchState(on)
   on('turn.complete', ($, e) => ({ text: e.answer }))
   await $.session.start(START)
-  await $.session.compact({ trigger: 'auto', messages: BEFORE })
+
+  const nothing = await $.tool.call({ tool: APPLY })
+  expect(nothing.deny).toContain('no compaction has run yet')
+  const first = await $.session.compact({ trigger: 'auto', messages: BEFORE })
+  world.transcript = [...(first.messages ?? [])]
+  const unchanged = await $.tool.call({ tool: APPLY })
+  expect(unchanged.deny).toContain('is the summary in use')
+  expect(writes.some(w => w.key === 'pendingApply' && w.value === true)).toBe(false)
+
   world.files.set(`${DIR}/01/summary.md`, `${SUMMARY}\nEdited.`)
   await $.tool.call({ tool: APPLY })
-  expect(world.compactions).toBe(1)
-
-  const ends = [
-    $.turn.complete({ answer: 'a', durationMs: 5, isAborted: false, turnId: 't1', reason: 'answer' }),
-    $.turn.complete({ answer: 'b', durationMs: 5, isAborted: false, turnId: 't2', reason: 'answer' }),
-  ]
-  const [first, second] = await Promise.all(ends)
-
-  expect(first?.text).toBe('a')
-  expect(second?.text).toBe('b')
-  expect(world.compactions).toBe(2)
+  world.box = 'a prompt half typed'
+  await $.turn.complete(MAIN_END)
+  expect(world.box).toBe('a prompt half typed')
+  expect(world.toasts.at(-1)).toContain('run /compact to apply')
 })

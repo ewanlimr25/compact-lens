@@ -1,5 +1,8 @@
-/** Who ran a recorded compaction: the engine's triggers, or an `apply` of an edited summary. */
-export type CompactLensTrigger = 'manual' | 'auto' | 'plugin' | 'apply'
+/**
+ * Who ran a recorded compaction: the engine's triggers, an `apply` of an edited summary, or
+ * `unseen`: one the mod did not see run (it was not listening), recorded from its summary afterwards.
+ */
+export type CompactLensTrigger = 'manual' | 'auto' | 'plugin' | 'apply' | 'unseen'
 
 /** One recorded compaction of this session: its number, its folder and its counts. */
 export type CompactLensRecord = {
@@ -17,6 +20,8 @@ export type CompactLensRecord = {
   tokensAfter: number | null
   /** The first 400 characters of the summary's text, to find the summary again. */
   summaryHead: string
+  /** The whole summary's length and hash, to tell it from another with the same opening; absent in records from before 0.3.0. */
+  summaryHash?: string
   /** How many of the person's prompts the compacted span held (listed verbatim in lost.md). */
   promptsInSpan: number
   /** How many files the span edited, wrote or read (listed in lost.md). */
@@ -35,7 +40,7 @@ declare module 'claude-code' {
       pinned: CompactLensPin[]
       /** The fill percent at which the warning was appended; null until it is, and again after a compaction. */
       warnedAt: number | null
-      /** True while an edited summary.md waits to replace the current summary. */
+      /** True while an edited summary.md waits for the person's /compact to replace the current summary. */
       pendingApply: boolean
       /** This session's snapshot folder, set at session.start. */
       sessionDir: string | null

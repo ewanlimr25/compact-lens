@@ -6,6 +6,142 @@ facts that must survive it, and lets the model or you edit the summary afterward
 It is a plugin of function hooks (Claude Code 2.1.288 or later). It hooks `session.compact`, the
 one event that carries the transcript being compacted and the result the engine produces.
 
+## Setting it up
+
+From a fresh clone to your first edited summary in seven steps. [What it does](#what-it-does)
+below is the reference for each part.
+
+### 1. Check your Claude Code
+
+```
+claude --version
+```
+
+You need 2.1.288 or later; `claude update` brings an older one up to date. There is nothing to
+build or install: Claude Code loads the TypeScript as it is, and the mod has no dependencies.
+
+### 2. Get the code
+
+```
+git clone https://github.com/ewanlimr25/compact-lens.git ~/compact-lens
+```
+
+Any folder works; the steps below use `~/compact-lens`. To check it before you load it:
+
+```
+cd ~/compact-lens
+claude plugin validate .
+claude plugin test .
+```
+
+`validate` ends with `✔ Validation passed`, and `test` with `0 fail`.
+
+### 3. Load it
+
+For one session, to try it:
+
+```
+claude --plugin-dir ~/compact-lens
+```
+
+For every session, desktop-app sessions included, add the folder to the `env` block of
+`~/.claude/settings.json`, merging it into the block you may already have:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_PLUGIN_DIRS": "~/compact-lens"
+  }
+}
+```
+
+The value is one or more folders, absolute or starting with `~`, separated by `:` (`;` on
+Windows). Claude Code reads it when a session starts, so start a new one. Only your user
+settings can set it, not a project's.
+
+### 4. Check that it loaded
+
+Type `/compact-lens`. It opens the pane and answers:
+
+```
+context not measured yet; 0 compactions; 0 pinned
+snapshots: /Users/you/.claude/compact-lens/<session-id>
+```
+
+The line under the prompt reads `compact-lens: – · 0 compactions · 0 pinned`, and shows the
+context fill once Claude has replied. If `/compact-lens` is an unknown command, see
+[Troubleshooting](#troubleshooting).
+
+### 5. Your first compaction
+
+Work as usual. When Claude Code compacts, on its own or because you ran `/compact`, the mod
+writes the first folder, `~/.claude/compact-lens/<session-id>/01/`. Then:
+
+- `/compact-lens show` prints what the summary dropped (`lost.md`): your prompts word for word,
+  the files and commands, and the paths and names the new context no longer mentions;
+- `/compact-lens show after` prints what the context holds now, and `show before` the transcript
+  that was compacted;
+- `/compact-lens list` lists every compaction and its folder.
+
+Claude gets a note after the summary that names these files, so you can also ask it to look
+something up: "check lost.md for the exact command we ran".
+
+### 6. Edit the summary
+
+1. Run `/compact-lens edit`. The summary goes into your prompt box under a dim first line,
+   `[compact-lens edit #01: …]`. Keep that line.
+2. Edit the text in the box, or press ctrl+g to edit it in your own editor.
+3. Press Enter. Claude Code shows `Prompt dropped by a hook: compact-lens: your edit is saved to
+   …/01/summary.md …`. That is expected: the edit was saved, and Claude never saw it as a
+   prompt. The mod then puts `/compact` in the prompt box.
+4. Press Enter on `/compact`. The mod answers it itself: it swaps the summary for your text,
+   keeps every message after it, and runs no summariser. A toast says `your edited summary is in
+   place (#02)`, and the swap is recorded as folder `02/` with trigger `apply`.
+
+To check, ask Claude what its summary says about the part you changed.
+
+An empty box at step 3 cancels. `/compact-lens cancel` drops an edit waiting at step 4, and a
+`/compact` with words after it (`/compact focus on the API`) compacts as usual and drops it too.
+
+### 7. Pin what must survive
+
+```
+/compact-lens keep the staging database is db-stg-2; never touch prod
+```
+
+A pinned note goes into the summariser's instructions and, word for word, into the note after
+every later summary. Claude can pin facts too, with its `keep` tool; it is reminded to once the
+context passes 70% full. `/compact-lens list` shows the pins, and `/compact-lens unpin <n>`
+removes one.
+
+### Turning it off
+
+Stop passing `--plugin-dir`, or take the folder out of `CLAUDE_CODE_PLUGIN_DIRS`, and start a new
+session. The snapshots stay in `~/.claude/compact-lens/` until you delete them; the pinned notes
+and the compaction records are in `~/.claude/plugins/store/compact-lens_*.json`.
+
+### Good to know
+
+- **The snapshots hold everything.** `before.md` and `before.json` are the whole compacted
+  transcript, tool results included, so anything the session read (a key in a `.env` file, say)
+  is in them. They stay on your machine; don't commit or share the folder.
+- **Disk.** A compaction of a long session writes a megabyte or two. A session's folder is safe
+  to delete once you won't resume that session.
+
+### Troubleshooting
+
+- **`/compact-lens` is an unknown command.** The mod did not load. Check `claude --version` and
+  that the path you gave holds `.claude-plugin/plugin.json`. When the module fails to load, a dim
+  line in the session says why, and `claude -p --plugin-dir ~/compact-lens "hi"` prints the
+  reason on stderr.
+- **Enter on my edit said "Prompt dropped by a hook".** That is the save; see step 6.
+- **`/compact` summarised as usual instead of applying my edit.** No edit was waiting: it was
+  cancelled, the text matched the summary already in use, or `/compact` had words after it. While
+  an edit waits, `/compact-lens` says so and the line under the prompt ends
+  `· /compact applies the edit`.
+- **My edit went to `edit-unapplied-<time>.md`.** A newer compaction ran while you were editing.
+  Run `/compact-lens edit` again to edit the current summary.
+
 ## What it does
 
 **At every compaction** (`/compact`, the automatic one, or one a plugin asked for), the mod writes
@@ -80,15 +216,6 @@ prompt reads `compact-lens: 72% · 1 compaction · 2 pinned`, and adds `· /comp
 while an edit waits.
 
 Subagent compactions pass through untouched.
-
-## Loading it
-
-Pick one:
-
-- for one session: `claude --plugin-dir /path/to/compact-lens`
-- for every session: add `CLAUDE_CODE_PLUGIN_DIRS=/path/to/compact-lens` to the `env` block of
-  `~/.claude/settings.json`, or symlink the folder as `~/.claude/skills/compact-lens` (a plugin
-  there auto-loads)
 
 ## Options
 

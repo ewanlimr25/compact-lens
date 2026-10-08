@@ -5,6 +5,8 @@
   "author": {
     "name": "Ewan"
   },
+  "license": "MIT",
+  "repository": "https://github.com/ewanlimr25/compact-lens",
   "types": "./types/index.d.ts",
   "userConfig": {
     "warnAtPercent": {

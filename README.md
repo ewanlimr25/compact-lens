@@ -38,13 +38,9 @@ claude plugin test .
 
 ### 3. Load it
 
-For one session, to try it:
+Load it one way, not both: a folder loaded twice runs every hook twice.
 
-```
-claude --plugin-dir ~/compact-lens
-```
-
-For every session, desktop-app sessions included, add the folder to the `env` block of
+**In every session** (the install). Add the folder to the `env` block of
 `~/.claude/settings.json`, merging it into the block you may already have:
 
 ```json
@@ -56,8 +52,16 @@ For every session, desktop-app sessions included, add the folder to the `env` bl
 ```
 
 The value is one or more folders, absolute or starting with `~`, separated by `:` (`;` on
-Windows). Claude Code reads it when a session starts, so start a new one. Only your user
-settings can set it, not a project's.
+Windows); if it already names a folder, add `:~/compact-lens` to the end. Claude Code reads it
+when a session starts, in the terminal, the desktop app and `claude -p` alike, so start a new
+session. Only your user settings can set it, not a project's.
+
+**In one session**, to try it first. Leave the settings alone and start Claude Code with the
+folder:
+
+```
+claude --plugin-dir ~/compact-lens
+```
 
 ### 4. Check that it loaded
 
@@ -114,9 +118,20 @@ every later summary. Claude can pin facts too, with its `keep` tool; it is remin
 context passes 70% full. `/compact-lens list` shows the pins, and `/compact-lens unpin <n>`
 removes one.
 
+### Updating
+
+```
+cd ~/compact-lens
+git pull
+```
+
+Claude Code watches the folder: a running terminal session reloads the mod once the files stop
+changing, and other sessions load the new version when they start. Snapshots and pinned notes
+are kept.
+
 ### Turning it off
 
-Stop passing `--plugin-dir`, or take the folder out of `CLAUDE_CODE_PLUGIN_DIRS`, and start a new
+Take the folder out of `CLAUDE_CODE_PLUGIN_DIRS` (or stop passing `--plugin-dir`) and start a new
 session. The snapshots stay in `~/.claude/compact-lens/` until you delete them; the pinned notes
 and the compaction records are in `~/.claude/plugins/store/compact-lens_*.json`.
 
@@ -134,6 +149,8 @@ and the compaction records are in `~/.claude/plugins/store/compact-lens_*.json`.
   that the path you gave holds `.claude-plugin/plugin.json`. When the module fails to load, a dim
   line in the session says why, and `claude -p --plugin-dir ~/compact-lens "hi"` prints the
   reason on stderr.
+- **Everything happens twice** (two notes after a summary, say). The mod is loaded twice, by
+  `CLAUDE_CODE_PLUGIN_DIRS` and a `--plugin-dir`, or from two folders. Keep one.
 - **Enter on my edit said "Prompt dropped by a hook".** That is the save; see step 6.
 - **`/compact` summarised as usual instead of applying my edit.** No edit was waiting: it was
   cancelled, the text matched the summary already in use, or `/compact` had words after it. While
@@ -243,6 +260,7 @@ hooks/notes.ts               the note, the warning, the system-prompt section (p
 hooks/paths.ts               the folder layout and the limits (pure)
 types/index.d.ts             the $.state contract
 tests/                       claude plugin test
+LICENSE                      MIT
 ```
 
 Every call on `$` sits in `hooks/register.tsx` because the engine's validator follows `$` only
@@ -257,3 +275,7 @@ claude plugin test .
 
 Type-check with the declarations the engine lays beside a loaded mod (`.claude-plugin/types/`),
 or with a `tsconfig.json` that includes the `claude-code.d.ts` the plugin-authoring skill writes.
+
+## License
+
+MIT; see [LICENSE](LICENSE).

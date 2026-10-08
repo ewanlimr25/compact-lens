@@ -8,7 +8,7 @@ one event that carries the transcript being compacted and the result the engine 
 
 ## Setting it up
 
-From a fresh clone to your first edited summary in seven steps. [What it does](#what-it-does)
+From install to your first edited summary in six steps. [What it does](#what-it-does)
 below is the reference for each part.
 
 ### 1. Check your Claude Code
@@ -18,30 +18,33 @@ claude --version
 ```
 
 You need 2.1.288 or later; `claude update` brings an older one up to date. There is nothing to
-build or install: Claude Code loads the TypeScript as it is, and the mod has no dependencies.
+build: Claude Code loads the TypeScript as it is, and the mod has no dependencies.
 
-### 2. Get the code
+### 2. Install it
+
+**From the marketplace** (the usual way). This repository is its own marketplace:
+
+```
+claude plugin marketplace add ewanlimr25/compact-lens
+claude plugin install compact-lens@compact-lens
+```
+
+The first command adds the marketplace, and the second installs the mod for your user, in every
+session. Inside a session, `/plugin install compact-lens --marketplace ewanlimr25/compact-lens`
+does both. Then start a new session.
+
+**From a clone**, to read or change the code:
 
 ```
 git clone https://github.com/ewanlimr25/compact-lens.git ~/compact-lens
-```
-
-Any folder works; the steps below use `~/compact-lens`. To check it before you load it:
-
-```
 cd ~/compact-lens
 claude plugin validate .
 claude plugin test .
 ```
 
-`validate` ends with `✔ Validation passed`, and `test` with `0 fail`.
-
-### 3. Load it
-
-Load it one way, not both: a folder loaded twice runs every hook twice.
-
-**In every session** (the install). Add the folder to the `env` block of
-`~/.claude/settings.json`, merging it into the block you may already have:
+`validate` ends with `✔ Validation passed`, and `test` with `0 fail`. To load the clone in every
+session, add it to the `env` block of `~/.claude/settings.json`, merging it into the block you
+may already have:
 
 ```json
 {
@@ -54,16 +57,13 @@ Load it one way, not both: a folder loaded twice runs every hook twice.
 The value is one or more folders, absolute or starting with `~`, separated by `:` (`;` on
 Windows); if it already names a folder, add `:~/compact-lens` to the end. Claude Code reads it
 when a session starts, in the terminal, the desktop app and `claude -p` alike, so start a new
-session. Only your user settings can set it, not a project's.
+session. Only your user settings can set it, not a project's. For one session only, start
+Claude Code with `claude --plugin-dir ~/compact-lens` instead.
 
-**In one session**, to try it first. Leave the settings alone and start Claude Code with the
-folder:
+Install it one way only: loaded twice (from the marketplace and a clone, or from two clones),
+every hook runs twice.
 
-```
-claude --plugin-dir ~/compact-lens
-```
-
-### 4. Check that it loaded
+### 3. Check that it loaded
 
 Type `/compact-lens`. It opens the pane and answers:
 
@@ -76,7 +76,7 @@ The line under the prompt reads `compact-lens: – · 0 compactions · 0 pinned`
 context fill once Claude has replied. If `/compact-lens` is an unknown command, see
 [Troubleshooting](#troubleshooting).
 
-### 5. Your first compaction
+### 4. Your first compaction
 
 Work as usual. When Claude Code compacts, on its own or because you ran `/compact`, the mod
 writes the first folder, `~/.claude/compact-lens/<session-id>/01/`. Then:
@@ -90,7 +90,7 @@ writes the first folder, `~/.claude/compact-lens/<session-id>/01/`. Then:
 Claude gets a note after the summary that names these files, so you can also ask it to look
 something up: "check lost.md for the exact command we ran".
 
-### 6. Edit the summary
+### 5. Edit the summary
 
 1. Run `/compact-lens edit`. The summary goes into your prompt box under a dim first line,
    `[compact-lens edit #01: …]`. Keep that line.
@@ -104,10 +104,10 @@ something up: "check lost.md for the exact command we ran".
 
 To check, ask Claude what its summary says about the part you changed.
 
-An empty box at step 3 cancels. `/compact-lens cancel` drops an edit waiting at step 4, and a
+An empty box at the third step cancels. `/compact-lens cancel` drops an edit waiting at the fourth, and a
 `/compact` with words after it (`/compact focus on the API`) compacts as usual and drops it too.
 
-### 7. Pin what must survive
+### 6. Pin what must survive
 
 ```
 /compact-lens keep the staging database is db-stg-2; never touch prod
@@ -120,18 +120,21 @@ removes one.
 
 ### Updating
 
+From the marketplace:
+
 ```
-cd ~/compact-lens
-git pull
+claude plugin update compact-lens@compact-lens
 ```
 
-Claude Code watches the folder: a running terminal session reloads the mod once the files stop
-changing, and other sessions load the new version when they start. Snapshots and pinned notes
-are kept.
+then start a new session. From a clone, `git pull` in it: Claude Code watches the folder, so a
+running terminal session reloads the mod once the files stop changing, and other sessions load
+the new version when they start. Either way, snapshots and pinned notes are kept.
 
 ### Turning it off
 
-Take the folder out of `CLAUDE_CODE_PLUGIN_DIRS` (or stop passing `--plugin-dir`) and start a new
+From the marketplace, `claude plugin uninstall compact-lens@compact-lens` (and
+`claude plugin marketplace remove compact-lens` to drop the marketplace too). From a clone, take
+the folder out of `CLAUDE_CODE_PLUGIN_DIRS` (or stop passing `--plugin-dir`). Then start a new
 session. The snapshots stay in `~/.claude/compact-lens/` until you delete them; the pinned notes
 and the compaction records are in `~/.claude/plugins/store/compact-lens_*.json`.
 
@@ -145,13 +148,14 @@ and the compaction records are in `~/.claude/plugins/store/compact-lens_*.json`.
 
 ### Troubleshooting
 
-- **`/compact-lens` is an unknown command.** The mod did not load. Check `claude --version` and
-  that the path you gave holds `.claude-plugin/plugin.json`. When the module fails to load, a dim
+- **`/compact-lens` is an unknown command.** The mod did not load. Check `claude --version`, then
+  that `claude plugin list` shows `compact-lens@compact-lens` enabled, or, for a clone, that the
+  path you gave holds `.claude-plugin/plugin.json`. When the module fails to load, a dim
   line in the session says why, and `claude -p --plugin-dir ~/compact-lens "hi"` prints the
   reason on stderr.
-- **Everything happens twice** (two notes after a summary, say). The mod is loaded twice, by
-  `CLAUDE_CODE_PLUGIN_DIRS` and a `--plugin-dir`, or from two folders. Keep one.
-- **Enter on my edit said "Prompt dropped by a hook".** That is the save; see step 6.
+- **Everything happens twice** (two notes after a summary, say). The mod is loaded twice: from
+  the marketplace and a clone, or from two clones. Keep one.
+- **Enter on my edit said "Prompt dropped by a hook".** That is the save; see step 5.
 - **`/compact` summarised as usual instead of applying my edit.** No edit was waiting: it was
   cancelled, the text matched the summary already in use, or `/compact` had words after it. While
   an edit waits, `/compact-lens` says so and the line under the prompt ends
@@ -249,6 +253,7 @@ In `/config` under the plugin, or `pluginConfigs.compact-lens` in settings:
 
 ```
 .claude-plugin/plugin.json   the manifest, the options, the state contract's path
+.claude-plugin/marketplace.json  the repository as a marketplace of one, so it installs by name
 hooks/hooks.json             names the hooks module
 hooks/register.tsx           every call on `$`: the hooks, the compaction, the tools, the command, the pane
 hooks/editor.ts              the edit in the prompt box: its header, finding it, judging it (pure)

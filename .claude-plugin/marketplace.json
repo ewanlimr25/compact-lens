@@ -1,6 +1,6 @@
 {
   "name": "compact-lens",
-  "description": "compact-lens, a Claude Code mod that records every compaction and lets the summary be edited.",
+  "description": "compact-lens, a Claude Code mod that shows what each compaction dropped and gives it back on request.",
   "owner": {
     "name": "Ewan"
   },
@@ -8,7 +8,7 @@
     {
       "name": "compact-lens",
       "source": "./",
-      "description": "See what a compaction takes away and what it leaves, pin facts that must survive it, and edit the summary afterwards."
+      "description": "See every compaction of a session and what its summary dropped, give your prompts or any lost detail back to Claude, pin facts that must survive, and edit the summary."
     }
   ]
 }

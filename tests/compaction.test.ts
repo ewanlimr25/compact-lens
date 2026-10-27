@@ -37,7 +37,7 @@ test('the snapshots hold the transcript, the summary, the record and the lost re
   expect(before).toContain('## 1 · user')
   expect(before).toContain('### tool Edit (t2)')
   expect(before).toContain('npm test -- --runInBand')
-  expect(JSON.parse(world.files.get(`${DIR}/01/before.json`) ?? '[]').length).toBe(6)
+  expect(world.files.has(`${DIR}/01/before.json`)).toBe(false)
   expect(world.files.get(`${DIR}/01/summary.md`)).toBe(SUMMARY)
   const meta = JSON.parse(world.files.get(`${DIR}/01/meta.json`) ?? '{}')
   expect(meta.n).toBe(1)
@@ -86,8 +86,8 @@ test('pinned notes reach the summariser and the note verbatim, and the person ca
   expect(world.files.get(`${DIR}/pinned.md`)).not.toContain('v1.4.2')
 })
 
-test('pins and records are mirrored to the store under the session id', async ($, on) => {
-  setup(on, { store: false })
+test('pins are mirrored to the store under the session id, and a session resumed later finds its pins and its recorded compactions', async ($, on) => {
+  const world = setup(on, { store: false })
   const stored = new Map<string, unknown>()
   on('store.get', ($, e) => ({ value: stored.get(e.key) }))
   on('store.set', ($, e) => {
@@ -95,13 +95,22 @@ test('pins and records are mirrored to the store under the session id', async ($
     return { value: undefined }
   })
   await $.session.start(START)
-
   await $.tool.call({ tool: KEEP, note: 'Keep me' })
   await $.session.compact({ trigger: 'auto', messages: BEFORE })
 
-  const held = stored.get(`session:${SESSION}`) as { pinned: Array<{ text: string }>; compactions: Array<{ n: number }> }
+  world.sessionId = 'sess-other'
+  const other = await $.command.run({ command: 'compact-lens', args: 'list', origin: { kind: 'composer' }, presentation: PRESENTATION })
+  world.sessionId = SESSION
+  const back = await $.command.run({ command: 'compact-lens', args: 'list', origin: { kind: 'composer' }, presentation: PRESENTATION })
+
+  const held = stored.get(`session:${SESSION}`) as { pinned: Array<{ text: string }> }
   expect(held.pinned[0]?.text).toBe('Keep me')
-  expect(held.compactions[0]?.n).toBe(1)
+  expect(Object.keys(held)).toEqual(['pinned'])
+  expect(other.text).toContain('compactions (0):')
+  expect(other.text).toContain('pinned (0):')
+  expect(back.text).toContain('compactions (1):')
+  expect(back.text).toContain('#1 auto')
+  expect(back.text).toContain('1. Keep me')
 })
 
 test("the person's /compact with an edit waiting replaces the summary with summary.md and never calls the summariser", async ($, on) => {
@@ -355,4 +364,46 @@ test("the summary in use is the first opening block that opens as one: after a r
   expect(summaryIn([api('user', 'hello'), api('assistant', 'hi'), api('user', UNSEEN_SUMMARY)], rows, [])).toBeUndefined()
   expect(summaryIn([api('user', 'Edited opening.\nmore')], [], ['Edited opening.'])).toBe('Edited opening.\nmore')
   expect(summaryIn([], rows, [])).toBeUndefined()
+})
+
+test("when recording fails after the summary came back, the engine's summary stands and the failure is logged", async ($, on) => {
+  const world = setup(on, { failWrite: path => path === `${DIR}/01/lost.md` })
+  await $.session.start(START)
+
+  const result = await $.session.compact({ trigger: 'auto', messages: BEFORE })
+
+  expect(world.compactions).toBe(1)
+  expect(result.messages?.[0]?.text).toBe(SUMMARY)
+  expect(world.logs.some(line => line.includes('compaction #1 could not be recorded'))).toBe(true)
+})
+
+test('a compaction that used your edit is recorded with its note though draft.md cannot be emptied, and the spent edit is not used again', async ($, on) => {
+  let isDiskFull = false
+  const world = setup(on, { failWrite: path => isDiskFull && path === `${DIR}/draft.md` })
+  await $.session.start(START)
+  await $.session.compact({ trigger: 'precompute', messages: BEFORE })
+  world.files.set(`${DIR}/draft.md`, `${SUMMARY}\nEdited before it landed.`)
+  isDiskFull = true
+
+  const first = await $.session.compact({ trigger: 'auto', messages: BEFORE })
+  const second = await $.session.compact({ trigger: 'auto', messages: BEFORE })
+
+  expect(first.messages?.[0]?.text).toBe(`${SUMMARY}\nEdited before it landed.`)
+  expect(first.messages?.[1]?.text).toContain('<compact-lens n="1" trigger="auto">')
+  expect(world.files.get(`${DIR}/01/summary.md`)).toBe(`${SUMMARY}\nEdited before it landed.`)
+  expect(world.logs.some(line => line.includes('could not be recorded'))).toBe(false)
+  expect(world.logs.some(line => line.includes(`${DIR}/draft.md could not be emptied`))).toBe(true)
+  expect(second.messages?.[0]?.text).toBe(SUMMARY)
+})
+
+test('an edited draft stays in draft.md when the compaction it was for cannot be recorded', async ($, on) => {
+  const world = setup(on, { failWrite: path => path === `${DIR}/01/summary.md` })
+  await $.session.start(START)
+  await $.session.compact({ trigger: 'precompute', messages: BEFORE })
+  world.files.set(`${DIR}/draft.md`, `${SUMMARY}\nEdited before it landed.`)
+
+  await $.session.compact({ trigger: 'auto', messages: BEFORE })
+
+  expect(world.files.get(`${DIR}/draft.md`)).toBe(`${SUMMARY}\nEdited before it landed.`)
+  expect(world.logs.some(line => line.includes('your edit is still in'))).toBe(true)
 })

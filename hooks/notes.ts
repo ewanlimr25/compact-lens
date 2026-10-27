@@ -1,6 +1,8 @@
-import type { CompactLensPin, CompactLensRecord } from '../types'
+// The texts the model reads (pure): the note after a summary, the warning ahead of a compaction, the
+// system-prompt section, and the pinned notes' directive for the summariser.
+import type { CompactLensContext, CompactLensPin, CompactLensRecord } from '../types'
 import type { CompactionFiles } from './paths'
-import { APPLY_TOOL, COMMAND, COMPACT_COMMAND, KEEP_TOOL } from './paths'
+import { APPLY_TOOL, COMMAND, COMPACT_COMMAND, KEEP_TOOL, RECALL_TOOL } from './paths'
 import { estimateTokens, fmtTokens } from './snapshot'
 
 /** The summariser's instruction for the pinned notes; undefined with none. */
@@ -25,16 +27,23 @@ export const plural = (n: number, word: string): string => `${n} ${word}${n === 
 const pinsBlock = (pins: readonly CompactLensPin[]): string[] =>
   pins.length === 0 ? [] : ['Pinned notes (kept verbatim through every compaction):', ...pins.map(p => `${p.id}. ${p.text}`)]
 
+/** What the span held that the summary may not: the counts the lost report gives. */
+const droppedLine = (record: CompactLensRecord): string => {
+  const weak = record.promptsWeak === undefined || record.promptsInSpan === 0 ? '' : ` (${record.promptsWeak} barely in the summary)`
+  const unnamed = record.filesUnnamed === undefined ? '' : ` (${record.filesUnnamed} never named again)`
+  return `The summary is lossy: the span held ${record.promptsInSpan} of the person's prompts${weak}, ${plural(record.filesInSpan, 'file')}${unnamed} and ${plural(record.identifiersLost, 'identifier')} the context no longer mentions.`
+}
+
 export type NoteArgs = { record: CompactLensRecord; files: CompactionFiles; pins: readonly CompactLensPin[]; keptCount: number }
 
-/** The user-role message inserted after a summary: the counts, the files and the pinned notes. */
+/** The user-role message inserted after a summary: the counts, how to get a detail back, the files and the pinned notes. */
 export const buildNote = ({ record, files, pins, keptCount }: NoteArgs): string =>
   [
     `<compact-lens n="${record.n}" trigger="${record.trigger}">`,
-    `Compaction #${record.n} (${record.trigger}) ran at ${record.at}. ${record.messagesBefore} messages (${tokensIn(record)}) went in; the summary above and ${keptCount} kept message${keptCount === 1 ? '' : 's'} (${tokensOut(record)}) came out.`,
-    'Files, written by compact-lens (read them with Read or search them with Grep when the summary lacks something):',
+    `Compaction #${record.n} (${record.trigger}) ran at ${record.at}. ${record.messagesBefore} messages (${tokensIn(record)}) went in; the summary above and ${plural(keptCount, 'kept message')} (${tokensOut(record)}) came out. ${droppedLine(record)}`,
+    `To get an exact detail back (a path, a number, a decision, the person's words), call ${RECALL_TOOL} with words to search for: it returns the matching passages of the compacted transcript verbatim. Files written by compact-lens (read them with Read, search them with Grep):`,
     `- before.md   ${files.before}   the whole transcript that was compacted, every tool call with its input and result`,
-    `- lost.md     ${files.lost}   the span's ${plural(record.promptsInSpan, 'prompt')} verbatim and its ${plural(record.filesInSpan, 'file')}, and the ${plural(record.identifiersLost, 'identifier')} the context no longer mentions`,
+    `- lost.md     ${files.lost}   what the summary dropped: the person's prompts verbatim, the files, the identifiers`,
     `- summary.md  ${files.summary}   the summary's text; edit it with Edit, then call ${APPLY_TOOL} and ask the person to press Enter on ${COMPACT_COMMAND}, which the mod answers with the edited text in place of the summary above (after an apply, the newest folder's summary.md is the one to edit); the person can edit it in the prompt box with /${COMMAND} edit`,
     ...pinsBlock(pins),
     `Pin a fact for the next compaction with ${KEEP_TOOL}.`,
@@ -49,40 +58,37 @@ export const buildApplyNote = (record: CompactLensRecord, files: CompactionFiles
     '</compact-lens>',
   ].join('\n')
 
-/** The fill and the auto-compaction line, as percents of one window. */
-export type WarningFigures = { percent: number; thresholdPercent: number | undefined }
+/** How far along the context is, as a whole percent: of the way to auto-compaction when that is known, else of the window. */
+export const progressPercent = (context: CompactLensContext): number => {
+  const base = context.threshold ?? context.window
+  return base <= 0 ? 0 : Math.round((100 * context.tokens) / base)
+}
 
-/** The context fill as a percent of the window: the engine's own, or its tokens over the window; undefined before the first response. */
-export const fillPercent = (context: { percent?: number; tokens?: number; window: number }): number | undefined =>
-  context.percent ?? (context.tokens === undefined || context.window <= 0 ? undefined : Math.round((100 * context.tokens) / context.window))
+/** The context in a few words: `412k of 470k before auto-compaction (88%)`, or of the window when the line is not known. */
+export const contextPhrase = (context: CompactLensContext): string =>
+  context.threshold === null
+    ? `${fmtTokens(context.tokens)} of a ${fmtTokens(context.window)} window (${progressPercent(context)}%)`
+    : `${fmtTokens(context.tokens)} of ${fmtTokens(context.threshold)} before auto-compaction (${progressPercent(context)}%)`
 
-export type Breakdown = { percentage: number; autoCompactThreshold?: number; rawMaxTokens: number }
+export type WarningArgs = { context: CompactLensContext; sessionDir: string }
 
-/** The fill and the auto-compaction line on the breakdown's compaction window, which may be smaller than the model's; the plain fill alone without one. */
-export const figuresOf = (breakdown: Breakdown | undefined, percent: number): WarningFigures =>
-  breakdown === undefined || breakdown.autoCompactThreshold === undefined || breakdown.rawMaxTokens <= 0
-    ? { percent, thresholdPercent: undefined }
-    : { percent: Math.round(breakdown.percentage), thresholdPercent: Math.round((100 * breakdown.autoCompactThreshold) / breakdown.rawMaxTokens) }
-
-export type WarningArgs = { percent: number; thresholdPercent: number | undefined; sessionDir: string }
-
-/** The one hidden note the model gets when the context fill crosses the warning line. */
-export const buildWarning = ({ percent, thresholdPercent, sessionDir }: WarningArgs): string =>
+/** The one hidden note the model gets when the context crosses the warning line. */
+export const buildWarning = ({ context, sessionDir }: WarningArgs): string =>
   [
     '<compact-lens>',
-    `Context is at ${percent}% of the window${thresholdPercent === undefined ? '' : `; auto-compaction runs near ${thresholdPercent}%`}. When it compacts, the whole transcript is saved under ${sessionDir}/ and the summary comes with a note of what it dropped (before.md, lost.md, summary.md). If a detail must survive verbatim (a decision, a path, a number, a name), pin it now with ${KEEP_TOOL}.`,
+    `Context is at ${contextPhrase(context)}. When it compacts, the summary will be lossy; compact-lens saves the whole transcript under ${sessionDir}/ and lists what the summary dropped (before.md, lost.md, summary.md), and ${RECALL_TOOL} finds an exact detail again. If a detail must survive verbatim (a decision, a path, a number, a name), pin it now with ${KEEP_TOOL}.`,
     '</compact-lens>',
   ].join('\n')
 
 export type SectionArgs = { sessionDir: string; records: readonly CompactLensRecord[]; pinnedCount: number }
 
-/** The session-scoped system-prompt section: where the snapshots are and what the tools do. */
+/** The session-scoped system-prompt section: where the snapshots are, how to get a detail back, what the tools do. */
 export const buildPromptSection = ({ sessionDir, records, pinnedCount }: SectionArgs): string => {
   const latest = records.at(-1)
   return [
     '# Compact Lens',
-    `This session records every compaction under ${sessionDir}/<nn>/: before.md (the whole transcript that was compacted), lost.md (what the summary does not mention), summary.md (the summary's text, editable), after.md (what the context held right after). Compactions so far: ${records.length}${latest === undefined ? '' : `; latest: ${latest.dir} (${latest.trigger}, ${latest.at})`}. Pinned notes: ${pinnedCount}.`,
-    `Tools: ${KEEP_TOOL} pins a fact so it survives every compaction verbatim; ${APPLY_TOOL} readies the edited summary.md, and the person's next ${COMPACT_COMMAND} replaces the current summary with it (the mod answers that ${COMPACT_COMMAND}; no summariser runs). The person runs /${COMMAND} edit to edit the summary in the prompt box, /${COMMAND} show lost to print what a compaction dropped, /${COMMAND} for the pane, /${COMMAND} keep <text>.`,
+    `This session records every compaction under ${sessionDir}/<nn>/: before.md (the whole transcript that was compacted), lost.md (what the summary dropped), summary.md (the summary's text, editable), after.md (what the context held right after). Compactions so far: ${records.length}${latest === undefined ? '' : `; latest: ${latest.dir} (${latest.trigger}, ${latest.at})`}. Pinned notes: ${pinnedCount}.`,
+    `When you need a detail from before a compaction (an exact path, number, decision, or the person's own words) and the summary lacks it, call ${RECALL_TOOL} with words to search for: it searches the session's transcript before the summary and returns the matching passages verbatim. ${KEEP_TOOL} pins a fact so it survives every compaction verbatim; ${APPLY_TOOL} readies the edited summary.md, and the person's next ${COMPACT_COMMAND} puts it in place of the current summary (the mod answers that ${COMPACT_COMMAND}; no summariser runs). The person runs /${COMMAND} to see what each compaction dropped and restore it, /${COMMAND} edit to edit the summary in the prompt box, /${COMMAND} keep <text> to pin.`,
   ].join('\n')
 }
 

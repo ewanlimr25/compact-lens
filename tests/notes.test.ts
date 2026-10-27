@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { CompactLensRecord } from '../types'
-import { buildNote, buildPinnedDirective, buildPromptSection, buildWarning, mergeInstructions } from '../hooks/notes'
+import { buildNote, buildPinnedDirective, buildPromptSection, buildWarning, contextPhrase, mergeInstructions, progressPercent } from '../hooks/notes'
 import { compactionFiles, lensRoot, sessionDirOf } from '../hooks/paths'
 
 const RECORD: CompactLensRecord = {
@@ -17,7 +17,9 @@ const RECORD: CompactLensRecord = {
   tokensAfter: 14000,
   summaryHead: 'This session',
   promptsInSpan: 12,
+  promptsWeak: 4,
   filesInSpan: 23,
+  filesUnnamed: 9,
   identifiersLost: 41,
 }
 
@@ -31,20 +33,30 @@ test('the note names the counts, the three files and the pinned notes verbatim',
   expect(note).toContain('184 messages (~100k tokens, estimated) went in')
   expect(note).toContain('1 kept message (14k tokens) came out')
   expect(note).toContain('/home/t/.claude/compact-lens/s/02/before.md')
-  expect(note).toContain("the span's 12 prompts verbatim and its 23 files, and the 41 identifiers the context no longer mentions")
+  expect(note).toContain("the span held 12 of the person's prompts (4 barely in the summary), 23 files (9 never named again) and 41 identifiers the context no longer mentions")
+  expect(note).toContain('call mcp__compact-lens__recall with words to search for')
   expect(note).toContain('1. The release tag is v1.4.2')
   expect(note).toContain('mcp__compact-lens__apply')
   expect(note).toContain('mcp__compact-lens__keep')
   expect(note.endsWith('</compact-lens>')).toBe(true)
 })
 
-test('the warning says where the fill stands, where the snapshots go and how to pin', async () => {
-  const text = buildWarning({ percent: 72, thresholdPercent: 83, sessionDir: '/home/t/.claude/compact-lens/s' })
+test('the warning says how close auto-compaction is, where the snapshots go, how to find a detail again and how to pin', async () => {
+  const text = buildWarning({ context: { tokens: 412000, window: 1000000, threshold: 467000 }, sessionDir: '/home/t/.claude/compact-lens/s' })
 
-  expect(text).toContain('Context is at 72% of the window; auto-compaction runs near 83%')
+  expect(text).toContain('Context is at 412k of 467k before auto-compaction (88%)')
   expect(text).toContain('/home/t/.claude/compact-lens/s/')
+  expect(text).toContain('mcp__compact-lens__recall')
   expect(text).toContain('mcp__compact-lens__keep')
-  expect(buildWarning({ percent: 72, thresholdPercent: undefined, sessionDir: 'd' })).toContain('Context is at 72% of the window.')
+  expect(buildWarning({ context: { tokens: 150000, window: 200000, threshold: null }, sessionDir: 'd' })).toContain('Context is at 150k of a 200k window (75%)')
+})
+
+test('progress is measured to where auto-compaction runs, which can sit far below the window, and to the window when that is unknown', async () => {
+  expect(progressPercent({ tokens: 467000, window: 1000000, threshold: 467000 })).toBe(100)
+  expect(progressPercent({ tokens: 233500, window: 1000000, threshold: 467000 })).toBe(50)
+  expect(progressPercent({ tokens: 233500, window: 1000000, threshold: null })).toBe(23)
+  expect(progressPercent({ tokens: 10, window: 0, threshold: null })).toBe(0)
+  expect(contextPhrase({ tokens: 233500, window: 1000000, threshold: 467000 })).toBe('234k of 467k before auto-compaction (50%)')
 })
 
 test('the pinned directive joins the instructions typed after /compact, and is absent with no pins', async () => {

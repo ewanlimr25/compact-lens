@@ -68,17 +68,6 @@ export type TranscriptHeader = { title: string; lines: readonly string[] }
 export const renderTranscript = (messages: readonly SessionMessage[], header: TranscriptHeader): string =>
   [`# ${header.title}`, header.lines.join('\n'), ...messages.map(renderMessage)].join('\n\n') + '\n'
 
-/** The raw record, the engine's handles left out. */
-export const toJson = (messages: readonly SessionMessage[]): string =>
-  JSON.stringify(
-    messages.map(m => {
-      const { handle: _handle, ...rest } = m
-      return rest
-    }),
-    null,
-    1,
-  )
-
 /** The index of the summary in a compaction's result: the first user message with text and no tool results. */
 export const findSummaryIndex = (messages: readonly SessionMessage[]): number =>
   messages.findIndex(m => m.role === 'user' && m.text.trim() !== '' && (m.toolResults ?? []).length === 0)

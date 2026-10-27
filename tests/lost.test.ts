@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
-import { bashReads, computeLost, extractIdentifiers, mergeSubstrings, renderLost } from '../hooks/lost'
+import { bashReads, computeLost, coverageOf, extractIdentifiers, mergeSubstrings, wordsOf } from '../hooks/lost'
+import { renderLost } from '../hooks/report'
 import { assistant, BEFORE, SUMMARY, user } from './kit'
 
 test('identifiers are paths, hashes, URLs, code spans, constants and references, and short or numeric ones are dropped', async () => {
@@ -41,7 +42,7 @@ test('the lost report lists prompts, files, commands and the identifiers the sum
   expect(report.messages).toBe(6)
   expect(report.toolUses).toBe(3)
   expect(report.prompts.length).toBe(1)
-  expect(report.prompts[0]).toContain('Please fix the bug')
+  expect(report.prompts[0]?.text).toContain('Please fix the bug')
   expect(report.filesEdited).toEqual(['/repo/src/app.ts'])
   expect(report.filesRead).toEqual(['/repo/src/app.ts'])
   expect(report.commands).toEqual(['npm test -- --runInBand'])
@@ -57,9 +58,11 @@ test('the lost report lists prompts, files, commands and the identifiers the sum
   expect(report.identifiersKept + report.identifiersLostTotal).toBe(report.identifiersFound)
 
   const text = renderLost(report, { n: 1, trigger: 'auto', at: '2026-10-07T12:00:00.000Z', beforePath: '/x/01/before.md' })
-  expect(text).toContain('# lost — compaction #1 (auto)')
-  expect(text).toContain("## The person's prompts")
-  expect(text).toContain('## Files edited or written (1)')
+  expect(text).toContain('# What compaction #1 (auto) dropped')
+  expect(text).toContain('## At a glance')
+  expect(text).toContain('/compact-lens restore 1')
+  expect(text).toContain('## Your prompts, verbatim')
+  expect(text).toContain('### Files edited or written (1)')
   expect(text).toContain('`deadbeef1` ×1')
 })
 
@@ -105,7 +108,7 @@ test("slash commands and their output are not counted as the person's prompts, a
     '',
   )
 
-  expect(report.prompts).toEqual(['the one real prompt'])
+  expect(report.prompts.map(p => p.text)).toEqual(['the one real prompt'])
   expect(report.slashCommands).toEqual(['/model opus', '/plugin-authoring see if it is built', '/effort'])
   const text = renderLost(report, { n: 1, trigger: 'manual', at: 't', beforePath: 'b' })
   expect(text).toContain('slash commands: 3')
@@ -119,6 +122,9 @@ test('files read with cat, head or sed in Bash are listed with the Read files; f
   expect(bashReads('git status && npm test src/app.ts')).toEqual([])
   expect(bashReads("cat <<'EOF' > /repo/notes/plan.md\nhead of the plan: README.md first\nEOF")).toEqual([])
   expect(bashReads('cat src/a.ts > src/b.ts; sed -i "" s/a/b/ src/c.ts; grep -rn TODO src/')).toEqual(['src/a.ts'])
+  expect(bashReads("sed -n '/^def _rescale/,/^def /p' engine/walk.py | head -40")).toEqual(['engine/walk.py'])
+  expect(bashReads("grep -n '<command-name>' notes/a.md 2>/dev/null; grep -rl import.ts src/x.ts; grep -n -e foo.bar lib/b.ts")).toEqual(['notes/a.md', 'src/x.ts', 'lib/b.ts'])
+  expect(bashReads("awk -F, '{print $1}' data/rows.csv; jq -r '.items' out/report.json")).toEqual(['data/rows.csv', 'out/report.json'])
 
   const report = computeLost(
     [assistant('Reading.', 'a1', [{ tool_use_id: 'b1', tool: 'Bash', input: { command: 'cat notes/plan.md && tail -n 5 /var/log/app.log' }, text: 'x' }])],
@@ -136,4 +142,34 @@ test("the size line gives the engine's token count when it has one, and the esti
   expect(estimated).toContain('tokens (')
   expect(estimated).toContain('at 4 a token')
   expect(estimated).not.toContain("engine's count")
+})
+
+test("a prompt the summary barely reflects is marked, one it covers is not, and one too short to judge is neither", async () => {
+  const kept = wordsOf('The person asked to raise the retry limit in the network client to seven attempts.')
+  const report = computeLost(
+    [
+      user('Raise the retry limit in the network client to seven attempts', 'p1'),
+      user('Rename the billing tables and migrate every invoice to cents before Friday', 'p2'),
+      user('ok go', 'p3'),
+    ],
+    'The person asked to raise the retry limit in the network client to seven attempts.',
+  )
+
+  expect(coverageOf('Raise the retry limit in the network client to seven attempts', kept)).toBeGreaterThan(0.8)
+  expect(report.prompts.map(p => p.coverage === null ? 'short' : p.coverage < 0.4 ? 'weak' : 'kept')).toEqual(['kept', 'weak', 'short'])
+  expect(report.promptsWeak).toBe(1)
+  const text = renderLost(report, { n: 3, trigger: 'auto', at: '2026-10-20T10:00:00.000Z', beforePath: 'b' })
+  expect(text).toContain('1. ✓ Raise the retry limit')
+  expect(text).toContain('2. ✗ Rename the billing tables')
+  expect(text).toContain('3. – ok go')
+  expect(text).toContain('1 barely appear in the summary')
+})
+
+test('a file the span touched that the context after never names is listed with how it was touched', async () => {
+  const report = computeLost(BEFORE, 'The constant was raised.')
+  const named = computeLost(BEFORE, 'The constant in /repo/src/app.ts was raised.')
+
+  expect(report.filesUnnamed).toEqual([{ path: '/repo/src/app.ts', how: 'edited' }])
+  expect(named.filesUnnamed).toEqual([])
+  expect(renderLost(report, { n: 1, trigger: 'auto', at: 't', beforePath: 'b' })).toContain('## Files never named after the compaction (1)\n- /repo/src/app.ts (edited)')
 })

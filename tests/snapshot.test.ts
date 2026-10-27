@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { contextText, cut, findSummaryIndex, renderTranscript, stripReminders, toJson, transcriptChars } from '../hooks/snapshot'
+import { contextText, cut, findSummaryIndex, renderTranscript, stripReminders, transcriptChars } from '../hooks/snapshot'
 import { BEFORE, SUMMARY } from './kit'
 
 test('the transcript renders one section per message, tool calls with their input and result, and marks empty ones', async () => {
@@ -19,15 +19,6 @@ test('the transcript renders one section per message, tool calls with their inpu
 test('a long text or result is cut and says by how much', async () => {
   expect(cut('abc', 5)).toBe('abc')
   expect(cut('abcdefgh', 5)).toBe('abcde\n… [cut: 3 more characters]')
-})
-
-test('the raw record drops the handles and keeps everything else', async () => {
-  const rows = JSON.parse(toJson(BEFORE)) as Array<Record<string, unknown>>
-
-  expect(rows.length).toBe(BEFORE.length)
-  expect(rows.every(row => !('handle' in row))).toBe(true)
-  expect(rows[1]?.toolUses).toEqual(BEFORE[1]?.toolUses)
-  expect(rows[2]?.toolResults).toEqual(BEFORE[2]?.toolResults)
 })
 
 test('the summary is the first user message with text and no tool results', async () => {

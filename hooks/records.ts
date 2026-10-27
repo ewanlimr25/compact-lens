@@ -1,11 +1,12 @@
 // The record of a compaction and the message helpers the compaction hook uses (pure).
 import type { SessionCompactInput, SessionCompactResult, SessionMessage } from 'claude-code'
 
-import type { CompactLensPin, CompactLensRecord } from '../types'
+import type { CompactLensPin, CompactLensRecord, CompactLensSpan, CompactLensTrigger } from '../types'
 import type { LostReport } from './lost'
 import type { CompactionFiles } from './paths'
 import { ENGINE_SUMMARY_OPENING, SUMMARY_HEAD_CHARS } from './paths'
 import { estimateTokens, fmtTokens, transcriptChars } from './snapshot'
+import type { Boundary } from './transcript'
 
 export type NextCompact = (e: SessionCompactInput) => Promise<SessionCompactResult>
 
@@ -64,9 +65,20 @@ export const insertAfter = (messages: readonly SessionMessage[], index: number, 
   ...messages.slice(index + 1),
 ]
 
+/** The counts a lost report gives a record. */
+const lostCounts = (lost: LostReport) => ({
+  promptsInSpan: lost.prompts.length,
+  promptsWeak: lost.promptsWeak,
+  filesInSpan: lost.filesEdited.length + lost.filesRead.filter(path => !lost.filesEdited.includes(path)).length,
+  filesUnnamed: lost.filesUnnamed.length,
+  identifiersLost: lost.identifiersLostTotal,
+})
+
+const summaryFields = (summary: string) => ({ summaryHead: summary.slice(0, SUMMARY_HEAD_CHARS), summaryHash: hashOf(summary) })
+
 export type RecordArgs = {
   n: number
-  trigger: CompactLensRecord['trigger']
+  trigger: CompactLensTrigger
   at: string
   files: CompactionFiles
   before: readonly SessionMessage[]
@@ -75,6 +87,8 @@ export type RecordArgs = {
   lost: LostReport
   tokensBefore?: number
   tokensAfter?: number
+  source?: 'live' | 'transcript'
+  span?: CompactLensSpan
 }
 
 export const buildRecord = (args: RecordArgs): CompactLensRecord => ({
@@ -82,23 +96,23 @@ export const buildRecord = (args: RecordArgs): CompactLensRecord => ({
   trigger: args.trigger,
   at: args.at,
   dir: args.files.dir,
+  source: args.source ?? 'live',
+  hasDetail: true,
+  ...(args.span === undefined ? {} : { span: args.span }),
   messagesBefore: args.before.length,
   messagesAfter: args.after.length,
   charsBefore: transcriptChars(args.before),
   charsAfter: transcriptChars(args.after),
   tokensBefore: args.tokensBefore ?? null,
   tokensAfter: args.tokensAfter ?? null,
-  summaryHead: args.summary.slice(0, SUMMARY_HEAD_CHARS),
-  summaryHash: hashOf(args.summary),
-  promptsInSpan: args.lost.prompts.length,
-  filesInSpan: args.lost.filesEdited.length + args.lost.filesRead.length,
-  identifiersLost: args.lost.identifiersLostTotal,
+  ...summaryFields(args.summary),
+  ...lostCounts(args.lost),
 })
 
 /** What every real compaction's record is built from: the transcript in, the result with its summary, the pins. */
 export type RecordCompactionArgs = {
   n: number
-  trigger: CompactLensRecord['trigger']
+  trigger: CompactLensTrigger
   at: string
   files: CompactionFiles
   before: readonly SessionMessage[]
@@ -109,7 +123,49 @@ export type RecordCompactionArgs = {
   tokensAfter?: number
 }
 
-/** The pins and records a store entry holds; empty lists for anything else. */
+/** The trigger a boundary row names, as a record's: `manual` and `auto` as written, anything else as the engine's own word for a plugin's. */
+export const triggerOf = (word: string): CompactLensTrigger => (word === 'manual' || word === 'auto' ? word : 'plugin')
+
+/**
+ * The record of a compaction known only from its boundary row: its number, time, trigger and tokens,
+ * and where it stands in the transcript. Its summary and span are read when first asked for.
+ */
+export const buildIndexRecord = (n: number, boundary: Boundary, span: CompactLensSpan, dir: string): CompactLensRecord => ({
+  n,
+  trigger: triggerOf(boundary.trigger),
+  at: boundary.at,
+  dir,
+  source: 'transcript',
+  hasDetail: false,
+  span,
+  messagesBefore: 0,
+  messagesAfter: 0,
+  charsBefore: 0,
+  charsAfter: 0,
+  tokensBefore: boundary.tokensBefore,
+  tokensAfter: boundary.tokensAfter,
+  summaryHead: '',
+  promptsInSpan: 0,
+  filesInSpan: 0,
+  identifiersLost: 0,
+})
+
+/** A record with its summary read: what an apply and an edit find it by. */
+export const withSummary = (record: CompactLensRecord, summary: string): CompactLensRecord => ({ ...record, ...summaryFields(summary) })
+
+/** A record once its span has been read from the transcript: the counts filled in. */
+export const withDetail = (record: CompactLensRecord, detail: { before: readonly SessionMessage[]; after: readonly SessionMessage[]; summary: string; lost: LostReport }): CompactLensRecord => ({
+  ...record,
+  hasDetail: true,
+  messagesBefore: detail.before.length,
+  messagesAfter: detail.after.length,
+  charsBefore: transcriptChars(detail.before),
+  charsAfter: transcriptChars(detail.after),
+  ...summaryFields(detail.summary),
+  ...lostCounts(detail.lost),
+})
+
+/** The pins a store entry holds, and the records a store entry of 0.3.0 held; empty lists for anything else. */
 export const heldLists = (held: unknown): { pinned: CompactLensPin[]; compactions: CompactLensRecord[] } => {
   const { pinned, compactions } = held !== null && typeof held === 'object' ? (held as { pinned?: unknown; compactions?: unknown }) : {}
   return {
@@ -118,30 +174,44 @@ export const heldLists = (held: unknown): { pinned: CompactLensPin[]; compaction
   }
 }
 
+/** A record read back from a folder's meta.json; undefined for anything that is not one. */
+export const parseRecord = (text: string): CompactLensRecord | undefined => {
+  try {
+    const value: unknown = JSON.parse(text)
+    if (value === null || typeof value !== 'object') return undefined
+    const record = value as Partial<CompactLensRecord>
+    return typeof record.n === 'number' && typeof record.trigger === 'string' && typeof record.at === 'string' && typeof record.dir === 'string'
+      ? (record as CompactLensRecord)
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export type UnseenArgs = { n: number; at: string; files: CompactionFiles; after: readonly SessionMessage[]; summary: string }
 
-/** The record of a compaction the mod did not see run: its summary and what follows it, nothing of what went in. */
+/** The record of a compaction the mod did not see run, where the transcript could not be read: its summary and what follows it. */
 export const buildUnseenRecord = ({ n, at, files, after, summary }: UnseenArgs): CompactLensRecord => ({
   n,
   trigger: 'unseen',
   at,
   dir: files.dir,
+  source: 'transcript',
+  hasDetail: false,
   messagesBefore: 0,
   messagesAfter: after.length,
   charsBefore: 0,
   charsAfter: transcriptChars(after),
   tokensBefore: null,
   tokensAfter: null,
-  summaryHead: summary.slice(0, SUMMARY_HEAD_CHARS),
-  summaryHash: hashOf(summary),
+  ...summaryFields(summary),
   promptsInSpan: 0,
   filesInSpan: 0,
   identifiersLost: 0,
 })
 
-/** A record's tokens in and out: the engine's counts, or the estimate where it gave none. */
+/** A record's tokens in and out: the engine's counts, or the estimate where it gave none; `?` where neither is known. */
 export const tokensOf = (record: CompactLensRecord): string => {
-  const before = record.tokensBefore ?? estimateTokens(record.charsBefore)
-  const after = record.tokensAfter ?? estimateTokens(record.charsAfter)
-  return `${fmtTokens(before)} → ${fmtTokens(after)}`
+  const side = (tokens: number | null, chars: number): string => (tokens !== null ? fmtTokens(tokens) : chars > 0 ? fmtTokens(estimateTokens(chars)) : '?')
+  return `${side(record.tokensBefore, record.charsBefore)} → ${side(record.tokensAfter, record.charsAfter)}`
 }

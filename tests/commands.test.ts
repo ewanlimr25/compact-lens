@@ -20,11 +20,11 @@ test('show prints the lost report by default, any snapshot file by name and numb
   const pinned = await run($, 'show pinned')
   const wrong = await run($, 'show everything')
 
-  expect(nothing.text).toContain('no compaction has run yet')
-  expect(lost.text?.startsWith(`${DIR}/01/lost.md\n\n# lost — compaction #1 (auto)`)).toBe(true)
+  expect(nothing.text).toContain('no compaction has run in this session yet')
+  expect(lost.text?.startsWith(`${DIR}/01/lost.md\n\n# What compaction #1 (auto) dropped`)).toBe(true)
   expect(summary.text).toBe(`${DIR}/01/summary.md\n\n${SUMMARY}`)
   expect(reversed.text?.startsWith(`${DIR}/01/after.md`)).toBe(true)
-  expect(missing.text).toBe(`${DIR}/07/before.md does not exist`)
+  expect(missing.text).toBe('nothing to show: there is no compaction #7; this session has 1 (1 to 1)')
   expect(pinned.text).toBe(`${DIR}/pinned.md does not exist`)
   expect(wrong.text).toContain('show takes one of lost, after, summary, before, pinned')
   expect(world.files.size).toBeGreaterThan(0)
@@ -44,7 +44,6 @@ test('show cuts a long file and says how much is left in it', async ($, on) => {
 test('cancel drops a waiting apply, so the next /compact compacts as usual', async ($, on) => {
   const world = setup(on)
   const writes = watchState(on)
-  on('ui.open', () => ({ value: { isPlaced: true as const } }))
   await $.session.start(START)
   const first = await $.session.compact({ trigger: 'auto', messages: BEFORE })
   world.transcript = [...(first.messages ?? [])]

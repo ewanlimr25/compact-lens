@@ -1,7 +1,7 @@
 {
   "name": "compact-lens",
-  "version": "0.3.0",
-  "description": "See what a compaction takes away and what it leaves, pin facts that must survive it, and edit the summary afterwards.",
+  "version": "0.4.0",
+  "description": "See every compaction of a session and what its summary dropped, give your prompts or any lost detail back to Claude, pin facts that must survive, and edit the summary.",
   "author": {
     "name": "Ewan"
   },
@@ -12,8 +12,8 @@
     "warnAtPercent": {
       "type": "number",
       "title": "Warn at",
-      "description": "Context fill, as a percent of the window, at which the model gets one note ahead of the compaction. 0 turns the note off.",
-      "default": 70
+      "description": "How close to auto-compaction, as a percent of the way there, the model gets one note ahead of the compaction (measured to the window when auto-compaction is off). 0 turns the note off.",
+      "default": 80
     },
     "dir": {
       "type": "string",
@@ -30,7 +30,7 @@
     "statusLine": {
       "type": "boolean",
       "title": "Status line",
-      "description": "Keep a line under the prompt with the context fill, the compactions so far and the pinned notes.",
+      "description": "Keep a line under the prompt with the context against auto-compaction, the compactions so far and the pinned notes.",
       "default": true
     }
   }

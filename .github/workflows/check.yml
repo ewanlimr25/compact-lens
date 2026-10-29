@@ -1,0 +1,29 @@
+# The checks CI runs on every push and pull request, none of which needs a Claude login: the manifest and
+# the modules as the engine reads them, and the mod's tests, on the oldest Claude Code the mod supports and
+# on the latest; then the tools' own tests. The type check needs the types the engine lays once it has
+# loaded the mod, so it runs locally, in `make check`.
+name: check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        claude-code: ['2.1.299', 'latest']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Claude Code ${{ matrix.claude-code }}
+        run: npm install --global --no-audit --no-fund @anthropic-ai/claude-code@${{ matrix.claude-code }}
+      - run: claude --version
+      - run: make validate test tools-test

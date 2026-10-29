@@ -9,7 +9,7 @@ import { computeLost } from './lost'
 import { APPLY_SUMMARY_ROWS, compactionFiles, COPY_SLACK, KEPT_WINDOW, pad2 } from './paths'
 import type { TranscriptIndex } from './reader'
 import { findTranscript, indexLines, readLines, readRange } from './reader'
-import { buildIndexRecord, buildUnseenRecord, isRecordedSummary, parseRecord, summaryIn, triggerOf, userMessage, withDetail, withSummary } from './records'
+import { buildIndexRecord, buildUnseenRecord, hashOf, isRecordedSummary, parseRecord, summaryIn, triggerOf, userMessage, withDetail, withSummary } from './records'
 import { renderLost } from './report'
 import { ensureSession, isoNow, log } from './session'
 import { contextText, renderTranscript } from './snapshot'
@@ -190,7 +190,11 @@ async function withLatestSummary($: EngineInterface, path: string, dir: string, 
   if (text === undefined) return records
   const files = compactionFiles(dir, latest.n)
   try {
-    if (!(await $.fs.exists(files.summary))) await $.fs.write(files.summary, text)
+    if (!(await $.fs.exists(files.summary))) {
+      await $.fs.write(files.summary, text)
+      // Its mark: with no record on disk yet, a prune tells the summary as written from an edit of it by this.
+      await $.fs.write(files.mark, hashOf(text)).catch(error => log($, `${files.mark} was not written (${String(error)}); a prune keeps this folder`))
+    }
   } catch (error) {
     // The count stands without it; the summary is written at the next look.
     log($, `${files.summary} was not written (${String(error)}); the next look tries again`)
@@ -243,22 +247,25 @@ export const needsReading = (record: CompactLensRecord): boolean => record.hasDe
 /** The reads under way, by session and compaction. */
 const reading = new Map<string, Promise<CompactLensRecord | string>>()
 
-/** A compaction's record with its files written, read from the transcript where only its boundary was known; why not, otherwise. */
-export async function materialize($: EngineInterface, n: number): Promise<CompactLensRecord | string> {
+/**
+ * A compaction's record with its files written, read from the transcript where only its boundary was
+ * known, or where its folder went (`isGone`: a prune from another session); why not, otherwise.
+ */
+export async function materialize($: EngineInterface, n: number, isGone = false): Promise<CompactLensRecord | string> {
   const id = await $.session.id()
   const key = `${id}:${n}`
   const running = reading.get(key)
   if (running !== undefined) return running
-  const started = runMaterialize($, n, id).finally(() => reading.delete(key))
+  const started = runMaterialize($, n, id, isGone).finally(() => reading.delete(key))
   reading.set(key, started)
   return started
 }
 
-async function runMaterialize($: EngineInterface, n: number, id: string): Promise<CompactLensRecord | string> {
+async function runMaterialize($: EngineInterface, n: number, id: string, isGone: boolean): Promise<CompactLensRecord | string> {
   const dir = await ensureSession($)
   const record = (await getRecords($)).find(r => r.n === n)
   if (record === undefined) return `there is no compaction #${n}`
-  if (!needsReading(record)) return record
+  if (!isGone && !needsReading(record)) return record
   const map = await compactionMap($)
   if (typeof map === 'string') return `compaction #${n} is known by its summary alone: the session's transcript could not be read`
   if (record.span === undefined) return UNPAIRED(n)

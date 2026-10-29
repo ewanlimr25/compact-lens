@@ -3,7 +3,7 @@
 import type { EngineInterface } from 'claude-code'
 
 import { config } from './config'
-import { lensRoot, sessionDirOf } from './paths'
+import { lensRoot, rootChoice, sessionDirOf } from './paths'
 import { heldLists } from './records'
 import { getHeldSessionId, getSessionDir, startSessionState } from './state'
 import { storeKey } from './texts'
@@ -15,6 +15,16 @@ export function log($: EngineInterface, line: string): void {
 
 export async function isoNow($: EngineInterface): Promise<string> {
   return new Date(await $.clock.now()).toISOString()
+}
+
+/** The folder every session's snapshots go under: the dir option, or ~/.claude/compact-lens. */
+export async function snapshotRoot($: EngineInterface): Promise<string> {
+  return lensRoot((await $.env.get('HOME')) ?? '', config().dir)
+}
+
+/** Why the dir option was set aside for the default folder; undefined when it was not. */
+export async function rootProblem($: EngineInterface): Promise<string | undefined> {
+  return rootChoice((await $.env.get('HOME')) ?? '', config().dir).ignored
 }
 
 /**

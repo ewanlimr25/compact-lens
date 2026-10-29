@@ -12,6 +12,21 @@ import { cut } from './snapshot'
 /** A failed hook's reason, as a `.catch` handler reads it. */
 export const failureText = (failure: HookFailure): string => failure.message ?? failure.kind
 
+/** The command as the person types it. */
+export const COMMAND_LINE = `/${COMMAND}`
+
+/** Bytes per kilobyte and per megabyte, as sizes are shown. */
+const KILOBYTE = 1024
+const MEGABYTE = KILOBYTE * KILOBYTE
+
+/** A size in bytes, as `840 B`, `3.0 KB` or `12.4 MB`. */
+export const sizeText = (bytes: number): string =>
+  bytes < KILOBYTE ? `${bytes} B` : bytes < MEGABYTE ? `${(bytes / KILOBYTE).toFixed(1)} KB` : `${(bytes / MEGABYTE).toFixed(1)} MB`
+
+/** The toast when a version of the mod runs for the first time. */
+export const versionToast = (current: string, previous: string | undefined): string =>
+  `compact-lens ${current} is running${previous === undefined ? '' : ` (was ${previous})`}. ${COMMAND_LINE} doctor checks the setup; ${COMMAND_LINE} statusline puts the count in your own status line`
+
 /** The store key a session's pins are kept under. */
 export const storeKey = (sessionId: string): string => `session:${sessionId}`
 
@@ -32,9 +47,12 @@ export const HELP = [
   `/${COMMAND} unpin <n>             remove pinned note n`,
   `/${COMMAND} apply                 ready an edited summary.md; ${COMPACT_COMMAND} then applies it`,
   `/${COMMAND} cancel                drop a waiting apply; the edit stays in its file`,
+  `/${COMMAND} doctor                check the setup: versions, transcript, status line, perl, the snapshot folder, the status-line script`,
+  `/${COMMAND} statusline            put the compaction count in your own status line (ccstatusline, Claude Code's)`,
+  `/${COMMAND} prune <days>          list the sessions untouched for <days> days; it ends with the confirm that removes them`,
 ].join('\n')
 
-export const ARGUMENT_HINT = '[lost [n] | restore [n] [words] | edit | show [what] [n] | list | keep <text> | unpin <n> | apply | cancel]'
+export const ARGUMENT_HINT = '[lost [n] | restore [n] [words] | edit | show [what] [n] | list | keep <text> | unpin <n> | apply | cancel | doctor | statusline | prune <days> [confirm <code>]]'
 
 export const KEEP_DESCRIPTION =
   'Pin a fact so it survives every compaction of this session verbatim: a decision, a path, a number, a name, a rule. ' +
@@ -47,7 +65,8 @@ export const APPLY_DESCRIPTION =
 
 export const RECALL_DESCRIPTION =
   "Search what earlier compactions of this session took out of your context: the session's own transcript before each summary. " +
-  'Returns the passages that hold every word of `query` (put a phrase in double quotes to keep it whole), verbatim, newest first, each named by its compaction and transcript line. ' +
+  'Returns the passages that hold every word of `query` (put a phrase in double quotes to keep it whole), verbatim, newest first, each named by its compaction and transcript line; ' +
+  'where none holds them all, those that hold all but one, each naming the word it lacks. ' +
   "Use it when the summary lacks an exact detail you need: a path, a number, a command's output, a decision, or the person's own words. `compaction` limits the search to one compaction's span."
 
 /** What a waiting apply reads as, in the status reply and the pane. */

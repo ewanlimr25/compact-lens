@@ -8,6 +8,7 @@ import { config } from './config'
 import { buildWarning, contextPhrase, progressPercent } from './notes'
 import { ensureSession, log } from './session'
 import { getContext, getPins, getRecords, getWarnedAt, isApplyPending, setContext, setWarnedAt } from './state'
+import { writeStatusFile } from './statusline'
 import { statusLineText } from './texts'
 
 /** Where auto-compaction runs, for one session and window: read from the engine's breakdown, again after a compaction or a /model switch (the window changes). */
@@ -31,13 +32,11 @@ async function thresholdOf($: EngineInterface, sessionId: string, window: number
   }
 }
 
+/** The line under the prompt (unless the statusLine option turns it off), and the session's status for the status-line script. */
 export async function refreshStatus($: EngineInterface): Promise<void> {
-  if (!config().statusLine) {
-    $.ui.status(undefined)
-    return
-  }
   const [context, records, pins, isPending] = await Promise.all([getContext($), getRecords($), getPins($), isApplyPending($)])
-  $.ui.status(statusLineText({ context, records, pinCount: pins.length, isPending }))
+  $.ui.status(config().statusLine ? statusLineText({ context, records, pinCount: pins.length, isPending }) : undefined)
+  await writeStatusFile($, { compactions: records.length, pinned: pins.length, pending: isPending })
 }
 
 /** The context from the free usage call, against auto-compaction's line; undefined before the first response. */

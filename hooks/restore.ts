@@ -7,7 +7,7 @@ import { compactionMap, copyReachOf, leadOf, mayRewrite, readSpan, recordFor } f
 import { MIN_SEARCH_CHARS, RECALL_ROWS, RECALL_SCAN_CAP } from './paths'
 import type { Found } from './recall'
 import { needlesOf, passagesOfRow, promptsBlock, recallBlock, searchTerms } from './recall'
-import { linesHolding, readLines } from './reader'
+import { linesHolding, linesHoldingSome, readLines } from './reader'
 import { RECALL_UNAVAILABLE, UNPAIRED } from './texts'
 import { droppedBy, parseRow, signatureOf, spanOf } from './transcript'
 
@@ -86,7 +86,7 @@ type Collected = { found: Found[]; unread: number }
  * words), or the compaction wrote again past the scope, was kept through its compaction: the newer row
  * speaks for it.
  */
-async function collect($: EngineInterface, map: CompactionMap, scope: Scope, candidates: readonly number[], terms: readonly string[], kept: ReadonlySet<string>): Promise<Collected> {
+async function collect($: EngineInterface, map: CompactionMap, scope: Scope, candidates: readonly number[], terms: readonly string[], kept: ReadonlySet<string>, least: number): Promise<Collected> {
   const found: Found[] = []
   const seen = new Set(kept)
   let read = 0
@@ -102,13 +102,34 @@ async function collect($: EngineInterface, map: CompactionMap, scope: Scope, can
       if (signature !== '') seen.add(signature)
       const k = droppedBy(map.boundaries, line, typeof row.uuid === 'string' ? row.uuid : '')
       if (k === 0 || isWrittenAgain || (scope.n !== undefined && k !== scope.n)) continue
-      found.push(...passagesOfRow(line, row, terms).map(p => ({ ...p, n: k })))
+      found.push(...passagesOfRow(line, row, terms, least).map(p => ({ ...p, n: k })))
     }
   }
   return { found, unread: candidates.length - read }
 }
 
-/** The passages of the compacted transcript that hold every word of `query`, newest first, as a block for the model; the reason there can be none otherwise. */
+/** The passages in scope that hold at least `least` of the terms, and how many such rows were left unread. */
+async function searchIn($: EngineInterface, map: CompactionMap, scope: Scope, terms: readonly string[], least: number): Promise<Collected> {
+  const leading = terms.filter(term => term.length >= MIN_SEARCH_CHARS)
+  const needles = needlesOf([...leading, ...terms.filter(term => term.length < MIN_SEARCH_CHARS)])
+  const holding = least >= terms.length ? await linesHolding($, map.path, needles, leading.length) : await linesHoldingSome($, map.path, needles, least, leading.length)
+  const kept = await writtenAgain($, map.path, holding.filter(line => line > scope.last && line <= scope.twinsTo), scope.ranAt)
+  const candidates = holding.filter(line => line >= scope.first && line <= scope.last).reverse()
+  return collect($, map, scope, candidates, terms, kept, least)
+}
+
+/** How a recall's passages read in the reply: so many, and what each holds. */
+const foundPhrase = (count: number, least: number, termCount: number, query: string): string => {
+  if (count === 0) return `no passage mentioning "${query}"`
+  const passages = `${count} passage${count === 1 ? '' : 's'}`
+  return least < termCount ? `${passages} holding ${least} of the ${termCount} words of "${query}"` : `${passages} mentioning "${query}"`
+}
+
+/**
+ * The passages of the compacted transcript that hold every word of `query`, newest first, as a block for
+ * the model; where none holds them all and none was left unread, those that hold all but one, each naming
+ * the word it lacks. The reason there can be none otherwise.
+ */
 export async function recallPassages($: EngineInterface, query: string, n: number | undefined): Promise<Restored | string> {
   const terms = searchTerms(query)
   if (terms.length === 0) return 'say what to search for: one or more words, a "quoted phrase" kept whole'
@@ -117,11 +138,10 @@ export async function recallPassages($: EngineInterface, query: string, n: numbe
   if (typeof map === 'string') return noMapReason(map)
   const scope = scopeOf(map, n)
   if (typeof scope === 'string') return scope
-  const holding = await linesHolding($, map.path, needlesOf(terms))
-  const kept = await writtenAgain($, map.path, holding.filter(line => line > scope.last && line <= scope.twinsTo), scope.ranAt)
-  const candidates = holding.filter(line => line >= scope.first && line <= scope.last).reverse()
-  const { found: passages, unread } = await collect($, map, scope, candidates, terms, kept)
-  const block = recallBlock({ query, passages, scope: scope.label, transcript: map.path, unread })
-  const found = passages.length === 0 ? 'no passage' : `${passages.length} passage${passages.length === 1 ? '' : 's'}`
-  return { block, summary: `${found} mentioning "${query}"`, chars: block.length }
+  const exact = await searchIn($, map, scope, terms, terms.length)
+  const isExactEnough = exact.found.length > 0 || exact.unread > 0 || terms.length < 2
+  const least = isExactEnough ? terms.length : terms.length - 1
+  const { found: passages, unread } = isExactEnough ? exact : await searchIn($, map, scope, terms, least)
+  const block = recallBlock({ query, passages, scope: scope.label, transcript: map.path, unread, least, termCount: terms.length })
+  return { block, summary: foundPhrase(passages.length, least, terms.length, query), chars: block.length }
 }

@@ -6,7 +6,6 @@
 import type { EngineInterface } from 'claude-code'
 
 import { BOUNDARY_PROBE, projectFolderName, projectsDir, SUMMARY_PROBE } from './paths'
-import { leadOf } from './recall'
 import { getTranscript, setTranscript } from './state'
 import type { NumberedLine } from './transcript'
 import { grepLineNumbers, numberedPairs, sedPrintScript, taggedLineNumbers } from './transcript'
@@ -28,9 +27,19 @@ export const INDEX_SCRIPT =
 export const SEARCH_SCRIPT =
   'my $path = pop @ARGV; my @needles = map { (my $n = $_) =~ tr/A-Z/a-z/; $n } @ARGV; open(my $fh, "<", $path) or exit 2; LINE: while (my $l = <$fh>) { $l =~ tr/A-Z/a-z/; for my $n (@needles) { next LINE if index($l, $n) < 0 } print "$.\\n" }'
 
-/** A command's standard output as lines, streamed in, so no cap cuts it. Rejects when the command cannot start, or fails. */
-export async function outputLines($: EngineInterface, argv: readonly string[]): Promise<string[]> {
-  const lines: string[] = []
+/**
+ * The numbers of the lines that hold at least some of some texts, ASCII letters in any case, and one of
+ * the leading texts among them (the words long enough to search on): how many, then how many lead, then
+ * the texts, leading ones first, then the path, all arguments.
+ */
+export const AT_LEAST_SCRIPT =
+  'my $path = pop @ARGV; my ($least, $long) = splice(@ARGV, 0, 2); my @needles = map { (my $n = $_) =~ tr/A-Z/a-z/; $n } @ARGV; open(my $fh, "<", $path) or exit 2; while (my $l = <$fh>) { $l =~ tr/A-Z/a-z/; my @held = grep { index($l, $needles[$_]) >= 0 } 0 .. $#needles; print "$.\\n" if @held >= $least && grep { $_ < $long } @held }'
+
+/** Prints perl's version: whether the host has perl, for /compact-lens doctor. */
+export const PERL_PROBE = 'print "$^V\\n"'
+
+/** Each line of a command's standard output, handed to `onLine` as it is streamed in, so no cap cuts it. Rejects when the command cannot start, or fails. */
+async function eachLine($: EngineInterface, argv: readonly string[], onLine: (line: string) => void): Promise<void> {
   // The line being read, in the pieces it came in: joined once its end comes, so a long line costs no more than its length.
   const pending: string[] = []
   const stream = $.process.spawn({ argv })
@@ -38,18 +47,34 @@ export async function outputLines($: EngineInterface, argv: readonly string[]): 
     if (piece.stream !== 'stdout') continue
     const parts = piece.text.split('\n')
     if (parts.length > 1) {
-      lines.push(pending.join('') + (parts[0] ?? ''))
+      onLine(pending.join('') + (parts[0] ?? ''))
       pending.length = 0
-      for (const part of parts.slice(1, -1)) lines.push(part)
+      for (const part of parts.slice(1, -1)) onLine(part)
     }
     pending.push(parts.at(-1) ?? '')
   }
   const rest = pending.join('')
-  if (rest !== '') lines.push(rest)
+  if (rest !== '') onLine(rest)
   const ended = await stream.result
   if (ended.code !== null && ended.code > NO_MATCH) throw new Error(`${argv[0] ?? 'the command'} ended with code ${ended.code}`)
   if (ended.code === null && ended.signal !== null) throw new Error(`${argv[0] ?? 'the command'} was stopped (${ended.signal})`)
+}
+
+/** A command's standard output as lines, streamed in, so no cap cuts it. Rejects when the command cannot start, or fails. */
+export async function outputLines($: EngineInterface, argv: readonly string[]): Promise<string[]> {
+  const lines: string[] = []
+  await eachLine($, argv, line => void lines.push(line))
   return lines
+}
+
+/** The line numbers `grep -n` prints, each once, ascending, read as they come: a word matched a million times costs a number a line, not a string a match. */
+async function grepLines($: EngineInterface, argv: readonly string[]): Promise<number[]> {
+  const found = new Set<number>()
+  await eachLine($, argv, line => {
+    const n = Number.parseInt(line, 10)
+    if (Number.isInteger(n) && n > 0) found.add(n)
+  })
+  return [...found].sort((a, b) => a - b)
 }
 
 /** Whether `path` is a file there now. */
@@ -147,14 +172,45 @@ export async function readRange($: EngineInterface, path: string, from: number, 
   return out.map((text, i) => ({ line: from + i, text }))
 }
 
+/** The line numbers found in at least `least` of the lists (each holding a number once), ascending. */
+export const linesInEnough = (lists: ReadonlyArray<readonly number[]>, least: number): number[] => {
+  const counts = new Map<number, number>()
+  for (const line of lists.flat()) counts.set(line, (counts.get(line) ?? 0) + 1)
+  return [...counts].filter(([, count]) => count >= least).map(([line]) => line).sort((a, b) => a - b)
+}
+
 /**
- * The transcript's line numbers that hold every needle as the file spells it (JSON-escaped), ASCII in
- * any case. Without perl, grep finds the lines that hold the longest one, and the reader checks the rest.
+ * Without perl: one grep a leading needle, as grep -o prints one match of two that overlap, and the lines
+ * that hold enough of them. A short needle is never searched on its own, as its matches could fill the
+ * output: it counts as held here, and the reading of each row checks it.
  */
-export async function linesHolding($: EngineInterface, path: string, needles: readonly string[]): Promise<number[]> {
+async function grepHolding($: EngineInterface, path: string, needles: readonly string[], least: number, long: number): Promise<number[]> {
+  const lists = await Promise.all(needles.slice(0, long).map(needle => grepLines($, ['grep', '-n', '-o', '-i', '-F', '-e', needle, path])))
+  return linesInEnough(lists, Math.max(1, least - (needles.length - long)))
+}
+
+/**
+ * The transcript's line numbers that hold at least `least` of the needles, ASCII in any case, one of the
+ * first `long` (the words long enough to search on) among them: rows that hold only short words never
+ * use up a search's reads.
+ */
+export async function linesHoldingSome($: EngineInterface, path: string, needles: readonly string[], least: number, long: number): Promise<number[]> {
+  try {
+    return grepLineNumbers(await outputLines($, ['perl', '-e', AT_LEAST_SCRIPT, '--', String(least), String(long), ...needles, path]))
+  } catch {
+    return grepHolding($, path, needles, least, long)
+  }
+}
+
+/**
+ * The transcript's line numbers that hold every needle as the file spells it (JSON-escaped), ASCII in any
+ * case; the first `long` are the leading ones (the words long enough to search on): without perl, only
+ * they are searched, and the reading of each row checks the rest.
+ */
+export async function linesHolding($: EngineInterface, path: string, needles: readonly string[], long: number): Promise<number[]> {
   try {
     return grepLineNumbers(await outputLines($, ['perl', '-e', SEARCH_SCRIPT, '--', ...needles, path]))
   } catch {
-    return grepLineNumbers(await outputLines($, ['grep', '-n', '-o', '-i', '-F', '-e', leadOf(needles), path]))
+    return grepHolding($, path, needles, needles.length, long)
   }
 }

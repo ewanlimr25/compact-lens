@@ -12,13 +12,17 @@ import { handleSubmit, handleSubmitFailure } from './edit'
 import { needsReading, syncHistory } from './history'
 import { buildPromptSection } from './notes'
 import { readInBackground, renderPane } from './pane'
-import { COMMAND, COMPACT_COMMAND, KEEP_TOOL, PANE_ID, SYNC_DELAY_MS } from './paths'
+import { COMMAND, COMPACT_COMMAND, KEEP_TOOL, PANE_ID, PRUNE_DELAY_MS, SYNC_DELAY_MS } from './paths'
 import { pin } from './pins'
+import { autoPrune } from './prune'
 import { noteTranscript } from './reader'
 import { recallPassages } from './restore'
-import { ensureSession, log } from './session'
+import { makeRootPrivate } from './privacy'
+import { ensureSession, log, rootProblem, snapshotRoot } from './session'
 import { getPins, getRecords, getSessionDir, isApplyPending } from './state'
+import { refreshScript } from './statusline'
 import { APPLY_DESCRIPTION, ARGUMENT_HINT, failureText, KEEP_DESCRIPTION, RECALL_DESCRIPTION } from './texts'
+import { noteVersion } from './version'
 
 /** The mod's tools and its command, offered for the session. */
 async function registerSurface($: EngineInterface): Promise<void> {
@@ -34,7 +38,7 @@ async function registerSurface($: EngineInterface): Promise<void> {
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'The words to search for, all of which a passage holds; "a quoted phrase" is kept whole.' },
+        query: { type: 'string', description: 'The words to search for, all of which a passage holds (all but one where none holds them all); "a quoted phrase" is kept whole.' },
         compaction: { type: 'number', description: "Search only this compaction's span (its number, from 1); every compacted span when left out." },
       },
       required: ['query'],
@@ -61,6 +65,11 @@ async function catchUp($: EngineInterface, isLatestRead: boolean): Promise<void>
   } catch (error) {
     log($, `the session's compactions could not be read from its transcript (${String(error)})`)
   }
+}
+
+/** At start: a new version announced; a failure is logged, never thrown. */
+async function noteStart($: EngineInterface): Promise<void> {
+  await noteVersion($).catch(error => log($, `the version notice was not given (${String(error)})`))
 }
 
 /** A catch-up a moment from now, once the engine has written the rows of what just happened. */
@@ -111,12 +120,29 @@ async function promptSection($: EngineInterface): Promise<string> {
   return buildPromptSection({ sessionDir: dir ?? '(unset)', records, pinnedCount: pins.length })
 }
 
+/**
+ * At start: a dir option set aside says so, the snapshot root is made private (its snapshots copy the
+ * transcripts), and only a private root's status-line script is checked and kept current. Where no
+ * program can run (a surface without processes), nothing is said: no script can run there either.
+ */
+async function secureRoot($: EngineInterface): Promise<void> {
+  const [problem, root] = await Promise.all([rootProblem($), snapshotRoot($)])
+  if (problem !== undefined) $.ui.toast(`${problem}; snapshots go to ${root} instead`)
+  const privacy = await makeRootPrivate($)
+  if (privacy.kind === 'refused') log($, `${root} could not be made private (${privacy.reason}): its snapshots copy your transcripts, which Claude Code keeps for your eyes alone`)
+  if (privacy.kind !== 'private') return
+  await refreshScript($).catch(error => log($, `the status-line script was not checked (${String(error)})`))
+}
+
 /** The session's start, its switches (/clear, /resume) and compactions run without the mod's hook. */
 function onSession(on: On): void {
   on('session.start', async ($, e, next) => {
     await ensureSession($)
     await registerSurface($)
+    await secureRoot($)
     await catchUp($, true)
+    await noteStart($)
+    if (config().keepDays > 0) $.clock.after(PRUNE_DELAY_MS, () => void autoPrune($))
     if (config().openPane && e.isInteractive) void $.ui.open({ id: PANE_ID, title: 'Compact Lens' })
     return next(e)
   })
@@ -189,7 +215,7 @@ function onTools(on: On): void {
 
 /** The person's side: the command, the prompt box's edit, the system-prompt section and the pane. */
 function onPerson(on: On): void {
-  on('command.run', { command: COMMAND }, ($, e) => runCommand($, e.args)).catch(($, e, next) => ({
+  on('command.run', { command: COMMAND }, ($, e) => runCommand($, e.args, e.origin)).catch(($, e, next) => ({
     text: `the command failed: ${failureText(next.error)}`,
   }))
 

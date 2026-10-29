@@ -3,6 +3,7 @@ import type { Engine } from 'claude-code/testing'
 
 import { SYNC_DELAY_MS } from '../hooks/paths'
 import { INDEX_SCRIPT, SEARCH_SCRIPT } from '../hooks/reader'
+import { hashOf } from '../hooks/records'
 import { BEFORE, DIR, HOME, RECALL, SESSION, setup, START, SUMMARY, TRANSCRIPT, user, writeFile, writeTranscript } from './kit'
 import { APPLIED_SUMMARY, appliedCompactions, boundary, call, prompt, SPAN_ONE_PROMPT, summary, SUMMARY_TWO, twoCompactions } from './rows'
 
@@ -23,6 +24,40 @@ test('compactions that ran before the mod loaded are counted from the transcript
   expect(listed.text).toContain('  #2 manual 2026-10-20 10:13 UTC: 175k → 20k tokens; from the transcript, not read yet')
   expect(world.files.get(`${DIR}/02/summary.md`)).toBe(SUMMARY_TWO)
   expect(world.files.has(`${DIR}/01/summary.md`)).toBe(false)
+})
+
+test('the summary written from the transcript gets a mark of its text beside it, so a prune can tell an edit of it', async ($, on) => {
+  const world = setup(on)
+  writeTranscript(world, twoCompactions())
+
+  await $.session.start(START)
+
+  expect(world.files.get(`${DIR}/02/summary.md`)).toBe(SUMMARY_TWO)
+  expect(world.files.get(`${DIR}/02/summary.hash`)).toBe(hashOf(SUMMARY_TWO))
+})
+
+test('a compaction whose folder went, as a prune from another session removes it, is read again from the transcript when asked for', async ($, on) => {
+  const world = setup(on)
+  writeTranscript(world, twoCompactions())
+  await $.session.start(START)
+  const first = await run($, 'lost 1')
+  for (const path of [...world.files.keys()].filter(key => key.startsWith(`${DIR}/01/`))) world.files.delete(path)
+
+  const again = await run($, 'lost 1')
+
+  expect(again.text).toBe(first.text)
+  expect(world.files.has(`${DIR}/01/lost.md`)).toBe(true)
+})
+
+test('a summary.md already there, as an edit made in an earlier run, is left as it is and gets no mark', async ($, on) => {
+  const world = setup(on)
+  writeTranscript(world, twoCompactions())
+  writeFile(world, `${DIR}/02/summary.md`, 'the summary, as the person rewrote it')
+
+  await $.session.start(START)
+
+  expect(world.files.get(`${DIR}/02/summary.md`)).toBe('the summary, as the person rewrote it')
+  expect(world.files.has(`${DIR}/02/summary.hash`)).toBe(false)
 })
 
 test("a moment after the start the latest compaction's lost report is read in the background, and nothing is read twice", async ($, on) => {
@@ -144,8 +179,14 @@ test('the transcript is only ever read, by perl with its fixed scripts and sed, 
   await run($, 'restore 2')
   await run($, 'restore -canary')
 
-  expect(world.spawned.length).toBeGreaterThan(0)
-  for (const argv of world.spawned) {
+  // Beside the transcript's readers, the start makes the snapshot root private, and nothing else runs.
+  const readers = world.spawned.filter(argv => argv[0] !== '/bin/mkdir' && argv[0] !== '/bin/chmod')
+  expect(world.spawned.filter(argv => !readers.includes(argv))).toEqual([
+    ['/bin/mkdir', '-p', '-m', '700', `${HOME}/.claude/compact-lens`],
+    ['/bin/chmod', '700', `${HOME}/.claude/compact-lens`],
+  ])
+  expect(readers.length).toBeGreaterThan(0)
+  for (const argv of readers) {
     expect(['perl', 'sed']).toContain(argv[0])
     expect(argv.at(-1)).toBe(TRANSCRIPT)
     if (argv[0] === 'perl') expect([INDEX_SCRIPT, SEARCH_SCRIPT]).toContain(argv[2])

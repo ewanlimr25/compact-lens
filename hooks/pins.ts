@@ -3,15 +3,18 @@
 import type { EngineInterface } from 'claude-code'
 
 import type { CompactLensPin } from '../types'
+import { refreshStatus } from './ahead'
 import { renderPinned } from './notes'
 import { pinnedFile } from './paths'
 import { ensureSession, isoNow } from './session'
 import { getPins, setPins } from './state'
 import { storeKey } from './texts'
 
+/** pinned.md and the store hold the pins; the status line shows their count. */
 async function mirrorPins($: EngineInterface, dir: string, pins: readonly CompactLensPin[]): Promise<void> {
   await $.fs.write(pinnedFile(dir), renderPinned(pins))
   await $.store.set(storeKey(await $.session.id()), { pinned: pins })
+  await refreshStatus($)
 }
 
 /** Pins a note; its number and how many are pinned now. */

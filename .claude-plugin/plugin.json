@@ -1,6 +1,6 @@
 {
   "name": "compact-lens",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "See every compaction of a session and what its summary dropped, give your prompts or any lost detail back to Claude, pin facts that must survive, and edit the summary.",
   "author": {
     "name": "Ewan"
@@ -18,7 +18,7 @@
     "dir": {
       "type": "string",
       "title": "Snapshot folder",
-      "description": "Where the snapshots go. Empty means ~/.claude/compact-lens.",
+      "description": "Where the snapshots go: a full path, or one under ~/, not your home folder or above it; the mod makes it private unless it leads to your home folder or holds files compact-lens did not write. Empty means ~/.claude/compact-lens.",
       "default": ""
     },
     "openPane": {
@@ -32,6 +32,12 @@
       "title": "Status line",
       "description": "Keep a line under the prompt with the context against auto-compaction, the compactions so far and the pinned notes.",
       "default": true
+    },
+    "keepDays": {
+      "type": "number",
+      "title": "Keep snapshots for",
+      "description": "Days: at each session start, the snapshots of other sessions untouched (folder, transcript and status-line script) for longer are removed while their transcripts are still there and younger than Claude Code's cleanupPeriodDays (30 unless set); an only copy stays, so this removes something only below that. A value under 7 counts as 7; 0 keeps them all.",
+      "default": 0
     }
   }
 }

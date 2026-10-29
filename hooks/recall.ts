@@ -1,6 +1,6 @@
 // What a restore or a recall hands the model (pure): the person's prompts from a compacted span, or the
 // passages of the compacted transcript that match a search, as one block, verbatim, held to RESTORE_CAP.
-import { EXCERPT_RADIUS, RESTORE_CAP } from './paths'
+import { EXCERPT_RADIUS, MIN_SEARCH_CHARS, RESTORE_CAP } from './paths'
 import { shortTime } from './report'
 import { cut } from './snapshot'
 import type { NumberedLine } from './transcript'
@@ -21,9 +21,6 @@ export const searchTerms = (query: string): string[] =>
 
 /** Each term spelled as the transcript file spells it inside a quoted text, for the host's search. */
 export const needlesOf = (terms: readonly string[]): string[] => terms.map(term => JSON.stringify(term).slice(1, -1))
-
-/** The longest term: where the host can match one needle alone (grep), the rarest to look for. */
-export const leadOf = (needles: readonly string[]): string => [...needles].sort((a, b) => b.length - a.length)[0] ?? ''
 
 /** One part of a row worth showing: who or what it is, and its text. */
 type Piece = { label: string; text: string }
@@ -85,19 +82,27 @@ export const excerptAround = (text: string, term: string): string => {
   return `${start > 0 ? '…' : ''}${text.slice(start, end).trim()}${end < text.length ? '…' : ''}`
 }
 
-/** A matching part of the transcript: where it stands, who wrote it, and the text around the match. */
-export type Passage = { line: number; at: string; label: string; excerpt: string }
+/** A matching part of the transcript: where it stands, who wrote it, the text around the match, and the words it lacks (a partial match). */
+export type Passage = { line: number; at: string; label: string; excerpt: string; missing?: readonly string[] }
 
 /** A passage of the compacted transcript and the compaction that took it out of the context. */
 export type Found = Passage & { n: number }
 
-/** The parts of a parsed row that hold every term, each as a passage. */
-export const passagesOfRow = (line: number, row: Record<string, unknown>, terms: readonly string[]): Passage[] => {
+/**
+ * The parts of a parsed row that hold at least `least` of the terms (every one when left out), each as a
+ * passage. A part that lacks some must hold one long enough to search on, as a search must.
+ */
+export const passagesOfRow = (line: number, row: Record<string, unknown>, terms: readonly string[], least = terms.length): Passage[] => {
   if (terms.length === 0) return []
   const at = typeof row.timestamp === 'string' ? row.timestamp : ''
-  return piecesOf(row)
-    .filter(piece => terms.every(term => asciiLower(piece.text).includes(term)))
-    .map(piece => ({ line, at, label: piece.label, excerpt: excerptAround(piece.text, terms[0] ?? '') }))
+  return piecesOf(row).flatMap(piece => {
+    const text = asciiLower(piece.text)
+    const held = terms.filter(term => text.includes(term))
+    const isPartial = held.length < terms.length
+    if (held.length === 0 || held.length < least || (isPartial && !held.some(term => term.length >= MIN_SEARCH_CHARS))) return []
+    const missing = terms.filter(term => !held.includes(term))
+    return [{ line, at, label: piece.label, excerpt: excerptAround(piece.text, held[0] ?? ''), ...(isPartial ? { missing } : {}) }]
+  })
 }
 
 /** The parts of one transcript line that hold every term, each as a passage. */
@@ -126,28 +131,40 @@ const NOTE_ROOM = 160
 
 const roomFor = (head: readonly string[], tail: readonly string[]): number => RESTORE_CAP - [...head, ...tail].join('\n').length - NOTE_ROOM
 
-/** `unread`: how many rows holding every word the search stopped before reading. */
-export type RecallArgs = { query: string; passages: readonly Found[]; scope: string; transcript: string; unread: number }
+/**
+ * `unread`: how many rows holding the words the search stopped before reading. `least` of the query's
+ * `termCount` words each passage holds: every one, or all but one where no passage held them all.
+ */
+export type RecallArgs = { query: string; passages: readonly Found[]; scope: string; transcript: string; unread: number; least: number; termCount: number }
 
 const RECALL_END = '</compact-lens-recall>'
 
-const unreadLine = (unread: number): string =>
-  unread === 1
-    ? '1 more row holds every word but was not read: add a word, or name a compaction, to reach it.'
-    : `${unread} more rows hold every word but were not read: add a word, or name a compaction, to reach them.`
+/** What the rows hold, as the unread line says it: every word, or so many of them. */
+const heldWords = ({ least, termCount }: RecallArgs): string => (least >= termCount ? 'every word' : `${least} of the words`)
 
-const recallOpening = ({ query, passages, scope, transcript, unread }: RecallArgs): string => {
+const unreadLine = (unread: number, args: RecallArgs): string =>
+  unread === 1
+    ? `1 more row holds ${heldWords(args)} but was not read: add a word, or name a compaction, to reach it.`
+    : `${unread} more rows hold ${heldWords(args)} but were not read: add a word, or name a compaction, to reach them.`
+
+const recallOpening = (args: RecallArgs): string => {
+  const { query, passages, scope, transcript, unread, least, termCount } = args
+  if (passages.length > 0 && least < termCount)
+    return `No passage of ${scope} holds every word of "${query}". These hold ${least} of its ${termCount} words, verbatim, newest first; each names the word it lacks, the compaction that took it out of the context and its line in ${transcript}.`
   if (passages.length > 0) return `Passages from ${scope} that hold every word of "${query}", verbatim, newest first. Each is named by the compaction that took it out of the context and its line in ${transcript}.`
-  if (unread > 0) return `No passage of ${scope} read so far holds every word of "${query}". ${unreadLine(unread)}`
+  if (unread > 0) return `No passage of ${scope} read so far holds ${heldWords(args)} of "${query}". ${unreadLine(unread, args)}`
   return `Nothing in ${scope} matches "${query}". The compacted transcript is ${transcript}; a different word, or fewer words, may find it.`
 }
+
+/** What a partial passage lacks, at the end of its heading. */
+const lacking = (p: Found): string => (p.missing === undefined || p.missing.length === 0 ? '' : ` · lacks ${p.missing.map(word => JSON.stringify(word)).join(', ')}`)
 
 /** The recall's answer: the passages, newest first, each named by the compaction that removed it and its transcript line. */
 export const recallBlock = (args: RecallArgs): string => {
   const { query, passages, unread } = args
   const head = [`<compact-lens-recall query=${JSON.stringify(query)}>`, recallOpening(args)]
-  const entries = passages.map(p => `--- #${p.n} · line ${p.line} · ${p.label}${p.at === '' ? '' : ` · ${shortTime(p.at)}`}\n${p.excerpt}`)
-  const tail = passages.length > 0 && unread > 0 ? [`(${unreadLine(unread)})`] : []
+  const entries = passages.map(p => `--- #${p.n} · line ${p.line} · ${p.label}${p.at === '' ? '' : ` · ${shortTime(p.at)}`}${lacking(p)}\n${p.excerpt}`)
+  const tail = passages.length > 0 && unread > 0 ? [`(${unreadLine(unread, args)})`] : []
   const { kept, left } = fitting(entries, roomFor(head, [...tail, RECALL_END]))
   const more = left > 0 ? [`(${left} more passages not shown, past ${RESTORE_CAP} characters: search with more words, or name a compaction)`] : []
   return [...head, ...kept, ...more, ...tail, RECALL_END].join('\n')

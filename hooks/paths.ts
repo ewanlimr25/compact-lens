@@ -47,6 +47,14 @@ export const FREE_NAME_TRIES = 100
 export const BOUNDARY_PROBE = '"subtype":"compact_boundary"'
 /** What marks the summary row that follows a boundary. */
 export const SUMMARY_PROBE = '"isCompactSummary":true'
+/** How long after a session starts the snapshots older than the keepDays option are removed: never in the way of the start. */
+export const PRUNE_DELAY_MS = 10_000
+/** Claude Code's cleanupPeriodDays where the settings set none: a transcript untouched that long is deleted. */
+export const DEFAULT_CLEANUP_DAYS = 30
+/** How long a session that found no status-line script waits before it looks again: another session may install it. */
+export const SCRIPT_RECHECK_MS = 60_000
+/** Milliseconds in a day, for the keepDays option and /compact-lens prune. */
+export const DAY_MS = 86_400_000
 /** How long after the engine says a compaction ended the mod reads the transcript, so the boundary row is written. */
 export const SYNC_DELAY_MS = 500
 /** How many rows after a boundary an apply's summary (no summary mark) is looked for. */
@@ -83,6 +91,8 @@ export type CompactionFiles = {
   after: string
   lost: string
   meta: string
+  /** The hash of a summary.md written from the transcript, with no record beside it: an edit is told from it. */
+  mark: string
 }
 
 export const pad2 = (n: number): string => String(n).padStart(2, '0')
@@ -90,8 +100,40 @@ export const pad2 = (n: number): string => String(n).padStart(2, '0')
 export const expandHome = (path: string, home: string): string =>
   path === '~' ? home : path.startsWith('~/') ? `${home}${path.slice(1)}` : path
 
-export const lensRoot = (home: string, dirOption: string): string =>
-  dirOption.trim() === '' ? `${home}/${DEFAULT_FOLDER}` : expandHome(dirOption.trim(), home)
+/** A full path with its `.` and `..` steps taken, and no slash doubled or trailing: `/a/b/../c/` is `/a/c`. */
+export const normalPath = (path: string): string =>
+  `/${path
+    .split('/')
+    .reduce<string[]>((kept, step) => (step === '' || step === '.' ? kept : step === '..' ? kept.slice(0, -1) : [...kept, step]), [])
+    .join('/')}`
+
+/** The snapshot root, and why the dir option was set aside where it was. */
+export type RootChoice = { root: string; ignored?: string }
+
+/**
+ * The dir option when it names a folder by a full path (or one under ~/) that is not the home folder or a
+ * folder above it, which a prune would walk and the mod makes private; the default folder otherwise.
+ */
+export const rootChoice = (home: string, dirOption: string): RootChoice => {
+  const fallback = `${home}/${DEFAULT_FOLDER}`
+  const wanted = dirOption.trim()
+  if (wanted === '') return { root: fallback }
+  const expanded = expandHome(wanted, home)
+  if (!expanded.startsWith('/')) return { root: fallback, ignored: `the dir option "${wanted}" is not a full path (one starting with / or ~/)` }
+  const root = normalPath(expanded)
+  return isHomeOrAbove(root, home) ? { root: fallback, ignored: `the dir option "${wanted}" is your home folder or a folder above it` } : { root }
+}
+
+/**
+ * Whether a full path is the home folder or a folder above it, letters in any case: macOS's volumes
+ * do not tell `/Users/Me` from `/users/me`, and a folder that only differs so is no folder of its own.
+ */
+export const isHomeOrAbove = (path: string, home: string): boolean => {
+  const [folded, base] = [normalPath(path).toLowerCase(), home === '' ? '' : normalPath(home).toLowerCase()]
+  return folded === '/' || folded === base || base.startsWith(`${folded}/`)
+}
+
+export const lensRoot = (home: string, dirOption: string): string => rootChoice(home, dirOption).root
 
 export const sessionDirOf = (root: string, sessionId: string): string => `${root}/${sessionId}`
 
@@ -104,8 +146,14 @@ export const compactionFiles = (sessionDir: string, n: number): CompactionFiles 
     after: `${dir}/after.md`,
     lost: `${dir}/lost.md`,
     meta: `${dir}/meta.json`,
+    mark: `${dir}/summary.hash`,
   }
 }
+
+/** How line 2 of the status-line script opens, in every copy compact-lens writes and any copy of it the person keeps: a file without it is not compact-lens's. */
+export const SCRIPT_MARKER = '# compact-lens-statusline:'
+
+export const isOwnScript = (text: string): boolean => text.split('\n', 2)[1]?.startsWith(SCRIPT_MARKER) === true
 
 export const pinnedFile = (sessionDir: string): string => `${sessionDir}/pinned.md`
 export const draftFile = (sessionDir: string): string => `${sessionDir}/draft.md`

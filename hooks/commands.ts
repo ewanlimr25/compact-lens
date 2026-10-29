@@ -1,16 +1,20 @@
 // `/compact-lens [verb] [rest]`: the person's side of the mod. The engine prints each reply under the
 // plugin's name, and the model reads a reply too; `context` entries go to the model alone.
-import type { CommandRunResult, EngineInterface } from 'claude-code'
+import type { CommandRunResult, EngineInterface, PromptOrigin } from 'claude-code'
 
+import { refreshStatus } from './ahead'
 import { checkApplicable, scheduleOffer, setPending } from './apply'
 import { editStarted } from './editor'
+import { doctorText } from './doctor'
 import { currentSummary, scheduleEdit } from './edit'
 import { materialize, needsReading, recordFor, syncHistory } from './history'
 import { COMMAND, COMPACT_COMMAND, compactionFiles, EDIT_FILL_DELAY_MS, PANE_ID, pinnedFile } from './paths'
 import { pin, unpin } from './pins'
+import { pruneText } from './prune'
 import { recallPassages, restorePrompts } from './restore'
 import { ensureSession } from './session'
 import { getContext, getPins, getRecords, isApplyPending } from './state'
+import { statuslineText } from './statusline'
 import { formatList, formatShown, formatStatus, HELP, isNumberWord, numberOf, parseRestore, parseShow } from './texts'
 import type { ShowKind } from './texts'
 
@@ -28,13 +32,14 @@ async function listText($: EngineInterface): Promise<string> {
   return formatList(records, pins, dir)
 }
 
-/** A snapshot file of compaction n, read from the transcript first when only its boundary was known. */
+/** A snapshot file of compaction n, read from the transcript first when only its boundary was known, or when its folder went (a prune from another session). */
 async function snapshotText($: EngineInterface, kind: Exclude<ShowKind, 'pinned'>, n: number | undefined): Promise<string> {
   const record = await recordFor($, n)
   if (typeof record === 'string') return `nothing to show: ${record}`
-  const read = needsReading(record) && kind !== 'summary' ? await materialize($, record.n) : record
+  const path = compactionFiles(await ensureSession($), record.n)[kind]
+  const isGone = kind !== 'summary' && !needsReading(record) && !(await $.fs.exists(path))
+  const read = (needsReading(record) || isGone) && kind !== 'summary' ? await materialize($, record.n, isGone) : record
   if (typeof read === 'string') return `nothing to show: ${read}`
-  const path = compactionFiles(await ensureSession($), read.n)[kind]
   return (await $.fs.exists(path)) ? formatShown(path, await $.fs.read(path)) : `${path} does not exist`
 }
 
@@ -101,7 +106,7 @@ async function editText($: EngineInterface): Promise<string> {
 }
 
 /** `/compact-lens [verb] [rest]`. */
-export async function runCommand($: EngineInterface, args: string): Promise<CommandRunResult> {
+export async function runCommand($: EngineInterface, args: string, origin: PromptOrigin): Promise<CommandRunResult> {
   const trimmed = args.trim()
   const verb = trimmed.split(/\s+/)[0] ?? ''
   const tail = trimmed.slice(verb.length).trim()
@@ -130,6 +135,15 @@ export async function runCommand($: EngineInterface, args: string): Promise<Comm
       return { text: await applyText($) }
     case 'cancel':
       return { text: await cancelText($) }
+    case 'doctor':
+      return { text: await doctorText($) }
+    case 'prune':
+      return { text: await pruneText($, tail, origin) }
+    case 'statusline': {
+      const text = await statuslineText($)
+      await refreshStatus($)
+      return { text }
+    }
     default:
       return { text: HELP }
   }
